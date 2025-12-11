@@ -1,0 +1,5 @@
+transformers>=4.38.0
+accelerate>=0.27.0
+torch>=2.2.0
+datasets>=2.17.0
+kvpress @ git+https://github.com/NVIDIA/kvpress.git
