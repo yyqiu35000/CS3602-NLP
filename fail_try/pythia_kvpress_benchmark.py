@@ -7,7 +7,7 @@ import kvpress
 from kvpress import SnapKVPress, StreamingLLMPress, PyramidKVPress
 from kvpress.presses.base_press import BasePress
 import kvpress.utils
-from streaming_llm_standalone import StreamingLLM
+from utils import StreamingLLM
 import time
 import logging
 import datasets
