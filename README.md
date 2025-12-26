@@ -1,51 +1,90 @@
-# Pythia-2.8B StreamingLLM Reproduction (KV-Level Implementation)
+# StreamingLLM Implementation on Pythia-2.8B
 
-本项目是对 **StreamingLLM** 算法在 **Pythia-2.8B** (GPT-NeoX 架构) 上的复现与实验分析。
+本项目是对 **StreamingLLM** 算法在 **Pythia-2.8B** 模型上的复现与实验。项目采用侵入式 Patch 方案，通过自定义 `StreamingDynamicCache` 接管 KV Cache 管理，实现了 Attention Sink + Sliding Window 机制。
 
-我们实现了一个**侵入式 Patch (Monkey-Patching)** 方案，通过自定义 `StreamingDynamicCache` 接管 HuggingFace Transformers 的 KV Cache 管理，实现了 **Attention Sink + Sliding Window** 机制。
+##  项目结构
 
-## 🛠️ 核心功能与使用指南
+为了保持根目录整洁，项目核心代码与实验性代码进行了分离：
 
-本项目提供了两种运行模式，分别用于**性能评估**和**机制验证**。
+### 1. 核心运行文件 (根目录)
 
-### 1. 标准评估模式 (Benchmark)
+| 文件名 | 说明 |
+| :--- | :--- |
+| **`main.py`** | **项目主入口**。负责加载模型、数据集，并调度评估任务（PPL测试、速度测试）及调试模式。 |
+| **`pythia_streaming_patch.py`** | **核心实现**。包含 `StreamingDynamicCache` 类（实现 Sink+Window 驱逐策略）和 Monkey-Patching 逻辑。 |
+| **`requirements.txt`** | 项目运行所需的 Python 依赖库。 |
+
+### 2. 归档与实验 (子目录)
+
+| 目录 | 说明 |
+| :--- | :--- |
+| **`note/`** | **早期验证代码**。包含最初的非侵入式实现版本（如 `utils.py`, `test.py`）。这些代码通过手动裁剪 Cache 进行验证，仅作为原理参考。 |
+| **`innovation/`** | **进阶实验代码**。包含基于语义块压缩 (Semantic Block Compression) 的尝试，旨在探索比简单滑动窗口更高效的压缩策略。 |
+
+## 使用说明
+
+### 环境准备
+
+您可以选择以下任意一种方式配置环境：
+
+**方式一：使用 requirements.txt (推荐)**
+
+```bash
+pip install -r requirements.txt
+```
+
+**方式二：手动安装核心依赖**
+
+如果您希望手动控制版本，可以直接安装以下核心库：
+
+```bash
+# 安装 PyTorch (根据您的 CUDA 版本选择，这里以 CUDA 11.8 为例)
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+
+# 安装 Transformers 及其他 NLP 相关库
+pip install transformers datasets accelerate huggingface_hub
+```
+
+注：datasets版本应为2.x，最新版本可能会导致PG-19数据集加载失败。
+
+### 1. 标准评估模式
 运行完整的 PPL (困惑度) 测试和生成速度测试，对比 Baseline 与 StreamingLLM 的性能。
 
 ```bash
 python main.py
 ```
-
 **输出内容**：
 - 自动运行 Baseline, Streaming (Window=256), Streaming (Window=512) 等多组配置。
 - 在 **Wikitext** 和 **PG-19** 数据集上评估 PPL。
 - 测试 TTFT (首字延迟)、TPOT (生成耗时)、Throughput (吞吐量) 和 Peak Memory。
 - 最终生成 Markdown 格式的对比表格。
 
-### 2. 调试模式 (Debug Mechanics)
-用于直观观察 StreamingLLM 的内部运作机制，验证 KV Cache 是否按预期进行驱逐。
-
+### 2. 调试模式
+启动调试模式，打印每100token KV Cache 的形状变化，用于验证 Sink 和 Window 机制是否正常工作。
 ```bash
 python main.py test
 ```
+
 
 **输出内容**：
 - 运行单次 Streaming 生成任务。
 - **实时日志**：每 100 步或发生驱逐 (Eviction) 时，打印当前 KV Cache 的形状。
 - **验证点**：你可以清晰地看到 Cache 大小在达到 `Limit + Buffer` 后被压缩回 `Limit`，证明 Sink 机制和滑动窗口正在工作。
 
-##  项目文件结构
+### 3. 参数调整
 
-| 文件名 | 说明 |
-| :--- | :--- |
-| **`main.py`** | **项目主入口**。包含了标准评估 (`run_standard_benchmark`) 和调试模式 (`debug_test_mechanics`) 的完整逻辑。负责加载模型、数据集，并调度评估任务。 |
-| **`pythia_streaming_patch.py`** | **核心逻辑实现**。包含 `StreamingDynamicCache` 类（实现 Sink+Window 驱逐策略）和 Monkey-Patching 逻辑（注入模型 Forward 函数）。同时包含用于验证 O(1) 复杂度的 Attention 独立计时器。 |
-| **`test.ipynb` / `test.py`** | **早期探索代码**。基于非侵入式方案（手动压缩 Cache）的验证脚本。仅作为参考，用于对比 Monkey-Patching 方案的优越性。 |
-| **`utils.py`** | **辅助工具库**。为 `test.py` 提供非侵入式 `StreamingLLM` 类的实现及加载模型的辅助函数。 |
-| **`text/`** | **测试数据目录**。包含用于本地调试的长文本文件 (e.g., `long_normal.txt`)。 |
+在main.py全局变量中
+
+- `model_id`:使用的模型
+- `ppl_tokens`: 预测ppl使用的token数
+- `speed_tokens`: 预测生成对应数量的token
+- `Pre_tokens`:测速中预先给出的token数
+- `config`:streamingLLM参数设置
+
 
 ## 早期探索：非侵入式实现 (test.ipynb)
 
-在最终采用 Monkey-Patching 方案之前，我们首先在 `test.ipynb`/`test.py + utils.py` 中尝试了一种**非侵入式**的实现方案。
+在最终采用 Monkey-Patching 方案之前，我们首先在 note下的`test.ipynb`/`test.py + utils.py` 中尝试了一种**非侵入式**的实现方案。
 
 - **实现方式**：不修改模型源码，而是编写一个独立的 `StreamingLLM` 类，手动接管 `generate` 循环。在每一步生成后，显式调用 `compress_cache` 函数对 `past_key_values` 进行裁剪。
 - **压缩策略**：最初使用了 PyTorch 的 `index_select` 方法来提取 Sink 和 Window 区域的 Token。

@@ -23,12 +23,9 @@ configs = [
 ]
 model_id = "EleutherAI/pythia-2.8b" 
 device = "cuda"
-ppl_tokens = 2000
-speed_tokens = 2000
+ppl_tokens = 1000
+speed_tokens = 500
 Pre_tokens = 500
-# ==========================================
-#              辅助函数
-# ==========================================
 
 def load_long_text(dataset_name="wikitext", split="test", limit_chars=50000):
     """加载wiki/pg19文本用于测试"""
@@ -184,10 +181,6 @@ def print_results_table(results):
               f"{row['peak_mem']:<13.2f} |")
     print("="*160 + "\n")
 
-# ==========================================
-#              主逻辑函数
-# ==========================================
-
 def run_standard_benchmark():
     """执行标准测试流程：计算 PPL 和 Speed，并展示对比表格"""
     print("开始标准评估流程...")
@@ -200,7 +193,8 @@ def run_standard_benchmark():
     # 加载数据
     wiki_text = load_long_text("wikitext", limit_chars=50000)
     pg19_text = load_long_text("pg19", limit_chars=50000)
-    
+    import pdb
+    pdb.set_trace()
     results = []
     
     for config in configs:
@@ -211,7 +205,6 @@ def run_standard_benchmark():
             disable_streaming_llm(model) # 确保移除之前的 patch
             patch_attention_layers(model) # 仅 patch 计时器
         else:
-            # 这里的 debug=False，因为标准流程不需要打印内部调试信息
             enable_streaming_llm(model, n_sink=config["sink"], window_size=config["window"], debug=False)
             
         torch.cuda.empty_cache()
@@ -246,17 +239,12 @@ def run_standard_benchmark():
 
 def debug_test_mechanics():
     """调试函数：运行一次生成，开启 debug 模式以查看 KV Cache 内部状态"""
-    # 模拟用户要求的输出格式
     print("="*60)
     print(" Running Configuration: streaming_8_256")
     print("="*60)
     print("   [Mode] StreamingLLM (Sink=8, Window=256)")
     
-    model_id = "EleutherAI/pythia-160m"
-    # 这里我们不再重新加载模型，假设用户希望快速看到结果
-    # 但由于这是独立的测试函数，还是需要加载。
-    # 为了保持输出一致性，我们尽量匹配用户的日志风格
-    
+    model_id = "EleutherAI/pythia-160m"    
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     model = AutoModelForCausalLM.from_pretrained(model_id, dtype=torch.float16, device_map="cuda")
     
@@ -292,19 +280,10 @@ def debug_test_mechanics():
 if __name__ == "__main__":
     import argparse
     
-    # 简单通过命令行参数切换，或者默认运行 main
-    # 为了方便用户，如果没有参数则运行标准 main，如果用户想看 debug 可以手动调用或者改这里
-    # 根据用户需求："选择test函数则生成..."，我提供一个简单的交互选择或者默认运行 main
-    
-    # 简单的选择逻辑：
-    print("请选择运行模式:")
-    print("1. 运行标准评测 (Main Benchmark)")
-    print("2. 运行调试模式 (Debug Test)")
-    
-    # 这里为了自动化运行方便，我默认运行 Main。用户如果想运行 Debug，可以修改这里或传入参数。
-    # 或者我检查 sys.argv
     if len(sys.argv) > 1 and sys.argv[1] == "test":
+        print("运行调试模式")
         debug_test_mechanics()
     else:
         # 默认运行 Main
+        print("运行标准评测")
         run_standard_benchmark()
