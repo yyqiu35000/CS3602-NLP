@@ -10,3 +10,9 @@ __pycache__/
 # 忽略其他常见不需要提交的文件
 .DS_Store
 .vscode/
+
+worklog.md
+Guide.pdf
+hf_cache/
+models/
+NeurIPS-Template/
