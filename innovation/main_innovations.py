@@ -49,8 +49,8 @@ configs = [
 model_id = "EleutherAI/pythia-2.8b" 
 
 device = "cuda"
-ppl_tokens = 2500     # PPL 评估长度
-speed_tokens = 1500   # 测速生成长度 (与 main.py 保持一致)
+ppl_tokens = 1000     # PPL 评估长度
+speed_tokens = 500   # 测速生成长度 (与 main.py 保持一致)
 Pre_tokens = 500      # 测速 Prompt 长度 (与 main.py 保持一致)
 
 # ==========================================

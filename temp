@@ -1,0 +1,112 @@
+# StreamingLLM Implementation on Pythia-2.8B
+
+本项目是对 **StreamingLLM** 算法在 **Pythia-2.8B** 模型上的复现与实验。项目采用侵入式 Patch 方案，通过自定义 `StreamingDynamicCache` 接管 KV Cache 管理，实现了 Attention Sink + Sliding Window 机制。
+
+##  项目结构
+
+为了保持根目录整洁，项目核心代码与各实验分支进行了分离：
+
+### 1. 核心运行文件 (根目录)
+
+| 文件名 | 说明 |
+| :--- | :--- |
+| **`main.py`** | **项目主入口**。负责加载模型、数据集，并调度评估任务（PPL测试、速度测试）及调试模式。 |
+| **`pythia_streaming_patch.py`** | **核心实现**。包含 `StreamingDynamicCache` 类（实现 Sink+Window 驱逐策略）和 Monkey-Patching 逻辑。 |
+| **`requirements.txt`** | 项目运行所需的 Python 依赖库。 |
+
+### 2. 实验与探索 (子目录)
+
+| 目录 | 说明 |
+| :--- | :--- |
+| **`optimization/`** | **FlashAttention 集成**。尝试将 StreamingLLM 与 FlashAttention (SDPA) 结合，探索在流式场景下的极限性能优化。 |
+| **`innovation/`** | **压缩算法探索**。包含基于语义块压缩 (Semantic Block Compression) 的尝试，旨在探索比简单滑动窗口更高效的信息保留策略。 |
+| **`cooperate/`** | **混合策略实验**。尝试结合 StreamingLLM 与 H2O (Heavy Hitter Oracle) 等其他稀疏注意力机制。 |
+| **`debug_streaming/`** | **底层验证**。包含用于验证 Attention Mask 结构、RoPE 维度冲突等底层逻辑的独立测试脚本 (如 `verify_mask_logic.py`)。 |
+| **`note/`** | **早期验证代码**。包含最初的非侵入式实现版本，仅作为原理参考。 |
+
+## 使用说明
+
+### 环境准备
+
+推荐使用 `requirements.txt` 配置环境：
+
+```bash
+pip install -r requirements.txt
+```
+
+### 1. 标准评估模式
+运行完整的 PPL (困惑度) 测试和生成速度测试，对比 Baseline 与 StreamingLLM 的性能。
+
+```bash
+python main.py
+```
+**输出内容**：
+- 自动运行 Baseline, Streaming (Window=256), Streaming (Window=512) 等多组配置。
+- 在 **Wikitext** 和 **PG-19** 数据集上评估 PPL。
+- 测试 TTFT (首字延迟)、TPOT (生成耗时)、Throughput (吞吐量) 和 Peak Memory。
+
+### 2. 调试模式
+启动调试模式，打印每100token KV Cache 的形状变化，用于验证 Sink 和 Window 机制是否正常工作。
+```bash
+python main.py test
+```
+
+##  实现原理与优化
+
+### 1. 核心算法：Sink + Sliding Window
+StreamingLLM 的核心在于保留序列开头的初始 Tokens (Sink) 作为“注意力锚点”，同时仅保留最近的窗口 (Window)。
+
+### 2. Lazy Eviction & Buffer 机制
+为了减少 Python 层面频繁的张量拼接 (`torch.cat`) 开销，我们采用了 **Lazy Eviction** 策略：
+- **Buffer 区**：允许 Cache 作为一个 "Buffer" 增长 (如 64 tokens)。
+- **批量驱逐**：只有当 Cache 大小超过 `Limit + Buffer` 时，才触发一次驱逐操作。
+- **优势**：显著减少了 Python 带来的额外开销，提升了端到端速度。
+
+### 3. Mask 极速路径优化 (Optimization)
+在早期的实现中，为了解决 RoPE 与 Mask 维度的冲突，我们强制手动构建了一个 Mask。但这引入了额外的显存读写和加法开销，导致 Avg Attention Time 变慢。
+**最新优化**：我们在单步解码阶段 (Query Length=1) **跳过 Mask 构建**，将 `attention_mask` 置为 `None`。
+- 这恢复了底层 Attention 算子的 "No Mask" 极速路径 (纯 MatMul)。
+- **效果**：Avg Attn Time 从 ~140us 降低至 ~90us，显著优于 Baseline 的 ~120us。
+
+## 遇到的 Bug 与修复思路
+
+### Bug 1: RoPE 绝对位置与物理 Cache 维度的核心冲突
+**现象**：启用 Streaming 后 PPL 爆炸。
+**原因**：RoPE 需要逻辑位置 (Logical Position) 来计算旋转，而 Attention Mask 需要物理位置 (Physical Position) 来进行遮蔽。直接截断 KV Cache 会导致 `get_seq_length` 失效，进而导致 RoPE 计算错误或 Mask 维度不匹配。
+**修复**：
+1.  **RoPE 层面**：坚持让 `get_seq_length` 返回**逻辑长度**，确保 RoPE 旋转正确。
+2.  **Mask 层面**：在 Patch 代码中，基于物理 Cache 的结构手动构建 Mask，适配物理维度。
+3.  **最终优化**：在 Decoding 阶段直接通过 `None` Mask 绕过此问题，既解决了冲突又提升了速度。
+
+### Bug 2: Cache 已压缩但 PPL 异常爆炸
+**原因**：**Eager Eviction (急切驱逐)**。在 `update` 时立即驱逐旧 Token，导致当前步生成的 Token 无法“看到”它刚刚生成的最近几个 Token。
+**修复**：改为 **Lazy Eviction**。`update` 函数返回**完整**的 Cache 供当前步计算，计算完成后再更新底层存储。
+
+## 实验结果分析
+
+以下结果基于 **Pythia-2.8B** 在 **RTX 4060 Ti (16GB)** 上的实测数据。
+
+### 实验设置
+- **Task**: PPL Evaluation (Wikitext, PG-19) & Generation Speed
+- **Prompt Length**: 500 tokens
+- **Generation Length**: 500 tokens (Total 1000)
+
+### 结果对比
+
+| Configuration | Wikitext PPL | PG-19 PPL | Total Time (s) | Avg Attn (us) | Throughput (tok/s) | Peak Mem (GB) |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Baseline (Eager)** | 6.97 | 8.57 | 18.06 | 115.9 | 27.69 | 5.48 |
+| **StreamingLLM (Sink=8, Win=512)** | 7.72 | 8.52 | 17.88 | **89.9** | **29.18** | **5.37** |
+
+### 深度分析
+
+#### 1. 速度 (Speed) - 真正的 O(1) Attention
+*   **Avg Attention Time**：经过优化后，StreamingLLM 的平均 Attention 耗时仅为 **89.9 us**，显著低于 Baseline 的 **115.9 us**。
+*   **Total Time / Throughput**：得益于更快的 Attention 和更轻量的 KV Cache 管理，StreamingLLM 在总吞吐量上也实现了反超 (29.18 vs 27.69 tok/s)。
+*   **趋势**：随着生成长度的增加，Baseline 会因 O(N^2) 复杂度而指数级变慢，而 StreamingLLM 将保持恒定速度。
+
+#### 2. 质量 (Quality)
+*   **PPL**: StreamingLLM (Win=512) 在 Wikitext 上 PPL 略有上升 (6.97 -> 7.72)，但在 PG-19 上表现稳定 (8.57 -> 8.52)。这证明了 "Sink + Sliding Window" 策略能够有效保留长文本的核心语义。
+
+#### 3. 显存 (Memory)
+*   StreamingLLM 成功将显存占用控制在 **5.37 GB**，且不会随生成长度增加。相比之下，Baseline 的显存占用会随长度线性增长直至 OOM。

@@ -588,30 +588,39 @@ def patched_attention_forward_innovations(
     # Call attention
     need_weights = output_attentions
 
-    # FIX: Handle Attention Mask Mismatch
-    # When using Streaming Caches, the external attention_mask (based on original seq_len) 
-    # will be larger than the actual compressed/pruned KV cache.
-    # We must adjust it to match the current KV length.
+    # --- StreamingLLM Fix: Manual Mask Construction (Synced with patch) ---
+    # 解决 RoPE 需要逻辑位置而 Mask 需要物理位置的冲突
     if isinstance(layer_past, (SemanticBlockStreamingCache, POSStreamingCache)):
-        # Check if mask exists and mismatches
-        current_kv_len = key_states.shape[-2]
-        if attention_mask is not None:
-             mask_len = attention_mask.shape[-1]
-             if mask_len != current_kv_len:
-                 # Create a new causal mask for the current length
-                 # For generation (q_len=1), it's usually just all ones (visible)
-                 # because we already pruned the cache to contain only valid tokens.
-                 # Shape: [bsz, 1, q_len, k_len] -> [bsz, 1, 1, current_kv_len]
-                 new_mask = torch.zeros(
-                     (attention_mask.shape[0], 1, query_states.shape[-2], current_kv_len),
-                     dtype=attention_mask.dtype,
-                     device=attention_mask.device
-                 )
-                 attention_mask = new_mask
-                 
-                 # Ensure is_causal is False because we are providing a manual mask
-                 if "is_causal" in kwargs:
-                     kwargs["is_causal"] = False
+        b_sz, _, q_len, _ = query_states.shape
+        k_len = key_states.shape[-2]
+        
+        # 如果是 Chunk 处理 (q_len > 1)，需要对 Chunk 部分应用 Causal Mask
+        if q_len > 1:
+            # 初始化全 0 (Visible) Mask
+            min_val = torch.finfo(query_states.dtype).min
+            new_mask = torch.zeros((b_sz, 1, q_len, k_len), device=query_states.device, dtype=query_states.dtype)
+            
+            # 构建 Causal Mask (上三角为负无穷)
+            causal_mask = torch.full((q_len, q_len), min_val, device=query_states.device, dtype=query_states.dtype)
+            causal_mask = torch.triu(causal_mask, diagonal=1)
+            
+            # 将 Causal Mask 应用到 Mask 的最后 q_len 列
+            # 物理 Cache 的最后 q_len 个 Token 就是当前的 Query Chunk
+            if k_len >= q_len:
+                new_mask[:, :, :, -q_len:] = causal_mask
+            
+            # 覆盖传入的 attention_mask
+            attention_mask = new_mask
+            
+            # Ensure is_causal is False because we are providing a manual mask
+            if "is_causal" in kwargs:
+                kwargs["is_causal"] = False
+        else:
+            # [Optimization] Decoding 阶段 (q_len=1)
+            # 因为 Cache 中的所有 Token (Sink + Window) 对当前 Query 都是可见的 (都在过去)
+            # 所以我们不需要任何 Mask (全 0 Mask 等价于 None)
+            # 将 Mask 置为 None 以启用底层 "No Mask" 优化路径 (MatMul only)
+            attention_mask = None
 
     attn_output, attn_weights = attention_interface(
         self,

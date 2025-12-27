@@ -106,6 +106,7 @@ class StreamingDynamicCache(DynamicCache):
                 self.layers[layer_idx].values = torch.cat([v_sink, v_window], dim=-2)
 
     def get_seq_length(self, layer_idx=0):
+        # 恢复为返回逻辑长度，保证 RoPE 自动推断或模型内部逻辑正常（虽然我们显式传入了 position_ids，但模型其他部分可能依赖这个）
         if layer_idx in self._seen_tokens_by_layer:
             return self._seen_tokens_by_layer[layer_idx]
         return super().get_seq_length(layer_idx)
@@ -128,6 +129,27 @@ def patched_gpt_neox_attention_forward(
     qkv = self.query_key_value(hidden_states).view(hidden_shape).transpose(1, 2)
     query_states, key_states, value_states = qkv.chunk(3, dim=-1)
 
+    # [DEBUG] 验证参与旋转的是仅当前 Chunk 还是包含缓存
+    if self.layer_idx == 0:
+        print(f"  [RoPE Check] Key Shape entering RoPE: {key_states.shape} (Current Input Only)")
+        if position_embeddings is not None:
+             cos, sin = position_embeddings
+             # 反推 position_ids: cos 的形状通常是 [batch, seq_len, head_dim] 或类似
+             # 我们通过检查 cos 的非零模式或者直接打印形状来推断
+             # 对于 RoPE，cos 通常是预计算的，但其切片对应于 position_ids
+             # 这里我们直接打印前几个 token 的 cos 值（取第一个维度的第一个元素作为特征）来观察是否有位移
+             # 或者，如果 cache_position 被传入，我们也可以打印它
+             pass
+    
+    # [DEBUG] 打印推断出的 Position IDs (通过 cache_position 或 hidden_states 形状推测)
+    # 注意：在 GPT-NeoX 中，position_ids 通常是在模型最外层生成的，这里我们只能通过副作用观察
+    # 但我们可以打印 cache_position 如果它存在
+    if cache_position is not None and self.layer_idx == 0:
+         print(f"  [Pos Check] Cache Position: {cache_position}")
+    elif self.layer_idx == 0:
+         # 尝试从 position_embeddings 推断 (仅作示意，因为这里拿不到原始 position_ids)
+         pass
+
     cos, sin = position_embeddings
     query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
@@ -140,6 +162,64 @@ def patched_gpt_neox_attention_forward(
         }
         key_states, value_states = layer_past.update(key_states, value_states, self.layer_idx, cache_kwargs) 
 
+    # --- 修复 Mask 逻辑：手动构建 Mask 替代传入的 attention_mask ---
+    # 原因：传入的 attention_mask 依赖逻辑长度 (get_seq_length)，而 KV Cache 是物理长度 (Sink+Window+Current)
+    # 这会导致维度不匹配或未来信息泄露。我们需要基于物理长度构建正确的 Mask。
+    
+    query_len = query_states.shape[-2]
+    key_len = key_states.shape[-2]
+    
+    # 只有当 key_len 和 query_len 不一致时（即有 Past Cache），才需要特殊处理
+    # 且只有在 query_len > 1 (Chunk 处理) 时才需要复杂的 Causal Mask
+    # 如果 query_len == 1 (Generation)，默认全是 Past，不需要 Causal Mask (或者说是全 1)
+    
+    if layer_past is not None:
+         # 1. 丢弃传入的 attention_mask (通常是 [batch, 1, 1, logical_len] 或 [batch, 1, q_len, logical_len])
+         #    因为它与物理 key_len 不匹配
+         
+         # 2. 构建新的物理 Mask
+         # 目标形状: [batch, 1, query_len, key_len]
+         
+         if query_len > 1:
+             # Chunk Prefill 阶段
+             # Mask 结构: [Past (Sink+Window) | Current (Causal Lower Triangular)]
+             
+             past_len = key_len - query_len
+             
+             # 左半部分: Past Cache -> 全部可见 (True)
+             past_mask = torch.ones(query_len, past_len, device=query_states.device, dtype=torch.bool)
+             
+             # 右半部分: Current Chunk -> 因果掩码 (下三角为 True)
+             # diagonal=1 表示上三角(不含对角线)为 1，取反即下三角(含对角线)为 1
+             chunk_mask = torch.triu(torch.ones(query_len, query_len, device=query_states.device, dtype=torch.bool), diagonal=1)
+             chunk_mask = ~chunk_mask # 翻转为下三角
+             
+             # 拼接
+             # [query_len, key_len]
+             full_mask_2d = torch.cat([past_mask, chunk_mask], dim=-1)
+             
+             # 扩展维度 -> [1, 1, query_len, key_len]
+             new_mask = full_mask_2d.unsqueeze(0).unsqueeze(0)
+             
+             # 转换为 float mask (0.0 for True, -inf for False)
+             # 注意：GPTNeoX 的 attention 实现会加上 attention_mask，所以我们需要 0.0 和 -inf
+             # 但如果 attention_mask 原本是 4D，它会被直接使用。
+             # 我们这里直接替换。
+             
+             # 创建全 0 (可见) 
+             attention_mask = torch.zeros_like(new_mask, dtype=query_states.dtype)
+             # 将 False 的位置填为 -inf
+             attention_mask.masked_fill_(~new_mask, torch.finfo(query_states.dtype).min)
+             
+         else:
+             # Generation 阶段 (query_len = 1)
+             # 单个 Token 可以看到所有 Past + Self
+             # 所以全是 True (0.0)
+             # [1, 1, 1, key_len]
+             attention_mask = torch.zeros(1, 1, 1, key_len, device=query_states.device, dtype=query_states.dtype)
+             
+    # -----------------------------------------------------------
+
     attention_interface: Callable = eager_attention_forward
     if self.config._attn_implementation != "eager":
         attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
@@ -151,6 +231,31 @@ def patched_gpt_neox_attention_forward(
         torch.cuda.synchronize()
         start_t = time.time()
     # --------------------
+
+    if self.layer_idx == 0:
+        print(f"\n[DEBUG Layer {self.layer_idx}]")
+        print(f"  Query Shape: {query_states.shape}")
+        print(f"  Key Shape:   {key_states.shape}")
+        if layer_past is not None:
+             print(f"  Cache Seq Len: {layer_past.get_seq_length()}")
+        if attention_mask is not None:
+              print(f"  Mask Shape:  {attention_mask.shape}")
+              print(f"  Mask Dtype:  {attention_mask.dtype}")
+              
+              # Correctly calculate visible count based on dtype
+              if attention_mask.dtype == torch.bool:
+                  visible_count = attention_mask[0, 0, 0, :].sum().item()
+              else:
+                  # Assume float mask where visible is 0.0 and hidden is -inf
+                  visible_count = (attention_mask[0, 0, 0, :] > -100).sum().item()
+                  
+              print(f"  First Query Visible Keys: {visible_count}")
+              # Print full tensor for verification
+              torch.set_printoptions(threshold=10000, edgeitems=100)
+              import pdb
+              print(f"  First Query Mask Values: {attention_mask[0, 0, 0, :]}")
+        else:
+             print(f"  Mask is None")
 
     attn_output, attn_weights = attention_interface(
         self,

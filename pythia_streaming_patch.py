@@ -140,6 +140,38 @@ def patched_gpt_neox_attention_forward(
         }
         key_states, value_states = layer_past.update(key_states, value_states, self.layer_idx, cache_kwargs) 
 
+        # --- StreamingLLM Fix: Manual Mask Construction ---
+        # 解决 RoPE 需要逻辑位置而 Mask 需要物理位置的冲突
+        # 1. RoPE 使用逻辑位置 (由 get_seq_length 保证)
+        # 2. Mask 使用物理位置 (此处手动构建)
+        if isinstance(layer_past, StreamingDynamicCache):
+            b_sz, _, q_len, _ = query_states.shape
+            k_len = key_states.shape[-2]
+            
+            # 如果是 Chunk 处理 (q_len > 1)，需要对 Chunk 部分应用 Causal Mask
+            if q_len > 1:
+                # 初始化全 0 (Visible) Mask
+                min_val = torch.finfo(query_states.dtype).min
+                new_mask = torch.zeros((b_sz, 1, q_len, k_len), device=query_states.device, dtype=query_states.dtype)
+                
+                # 构建 Causal Mask (上三角为负无穷)
+                causal_mask = torch.full((q_len, q_len), min_val, device=query_states.device, dtype=query_states.dtype)
+                causal_mask = torch.triu(causal_mask, diagonal=1)
+                
+                # 将 Causal Mask 应用到 Mask 的最后 q_len 列
+                # 物理 Cache 的最后 q_len 个 Token 就是当前的 Query Chunk
+                if k_len >= q_len:
+                    new_mask[:, :, :, -q_len:] = causal_mask
+                
+                # 覆盖传入的 attention_mask
+                attention_mask = new_mask
+            else:
+                # [Optimization] Decoding 阶段 (q_len=1)
+                # 因为 Cache 中的所有 Token (Sink + Window) 对当前 Query 都是可见的 (都在过去)
+                # 所以我们不需要任何 Mask (全 0 Mask 等价于 None)
+                # 将 Mask 置为 None 以启用底层 "No Mask" 优化路径 (MatMul only)
+                attention_mask = None
+
     attention_interface: Callable = eager_attention_forward
     if self.config._attn_implementation != "eager":
         attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]

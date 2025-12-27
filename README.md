@@ -14,16 +14,21 @@
 | **`pythia_streaming_patch.py`** | **核心实现**。包含 `StreamingDynamicCache` 类（实现 Sink+Window 驱逐策略）和 Monkey-Patching 逻辑。 |
 | **`requirements.txt`** | 项目运行所需的 Python 依赖库。 |
 
-### 2. 归档与实验 (子目录)
+### 2. 实验与探索 (子目录)
 
 | 目录 | 说明 |
 | :--- | :--- |
-| **`note/`** | **早期验证代码**。包含最初的非侵入式实现版本（如 `utils.py`, `test.py`）。这些代码通过手动裁剪 Cache 进行验证，仅作为原理参考。 |
-| **`innovation/`** | **进阶实验代码**。包含基于语义块压缩 (Semantic Block Compression) 的尝试，旨在探索比简单滑动窗口更高效的压缩策略。 |
+| **`optimization/`** | **FlashAttention 集成**。尝试将 StreamingLLM 与 FlashAttention (SDPA) 结合，探索在流式场景下的极限性能优化。 |
+| **`innovation/`** | **压缩算法探索**。包含基于语义块压缩 (Semantic Block Compression) 的尝试，旨在探索比简单滑动窗口更高效的信息保留策略。 |
+| **`cooperate/`** | **混合策略实验**。尝试结合 StreamingLLM 与 H2O (Heavy Hitter Oracle) 等其他稀疏注意力机制。 |
+| **`debug_streaming/`** | **底层验证**。包含用于验证 Attention Mask 结构、RoPE 维度冲突等底层逻辑的独立测试脚本 (如 `verify_mask_logic.py`)。 |
+| **`note/`** | **早期验证代码**。包含最初的非侵入式实现版本，仅作为原理参考。 |
 
-## 使用说明
+## 个人完成部分说明
 
-### 环境准备
+### 使用说明
+
+#### 环境准备
 
 您可以选择以下任意一种方式配置环境：
 
@@ -35,11 +40,11 @@ pip install -r requirements.txt
 
 **方式二：手动安装核心依赖**
 
-如果您希望手动控制版本，可以直接安装以下核心库：
+如果requirements安装失败，可以尝试手动安装各个包：
 
 ```bash
-# 安装 PyTorch (根据您的 CUDA 版本选择，这里以 CUDA 11.8 为例)
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+# 安装 PyTorch (根据您的 CUDA 版本选择，这里以 CUDA 12.8 为例)
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 
 # 安装 Transformers 及其他 NLP 相关库
 pip install transformers datasets accelerate huggingface_hub
@@ -47,7 +52,7 @@ pip install transformers datasets accelerate huggingface_hub
 
 注：datasets版本应为2.x，最新版本可能会导致PG-19数据集加载失败。
 
-### 1. 标准评估模式
+#### 1. 标准评估模式
 运行完整的 PPL (困惑度) 测试和生成速度测试，对比 Baseline 与 StreamingLLM 的性能。
 
 ```bash
@@ -59,7 +64,7 @@ python main.py
 - 测试 TTFT (首字延迟)、TPOT (生成耗时)、Throughput (吞吐量) 和 Peak Memory。
 - 最终生成 Markdown 格式的对比表格。
 
-### 2. 调试模式
+#### 2. 调试模式
 启动调试模式，打印每100token KV Cache 的形状变化，用于验证 Sink 和 Window 机制是否正常工作。
 ```bash
 python main.py test
@@ -71,7 +76,7 @@ python main.py test
 - **实时日志**：每 100 步或发生驱逐 (Eviction) 时，打印当前 KV Cache 的形状。
 - **验证点**：你可以清晰地看到 Cache 大小在达到 `Limit + Buffer` 后被压缩回 `Limit`，证明 Sink 机制和滑动窗口正在工作。
 
-### 3. 参数调整
+#### 3. 参数调整
 
 在main.py全局变量中
 
@@ -82,7 +87,7 @@ python main.py test
 - `config`:streamingLLM参数设置
 
 
-## 早期探索：非侵入式实现 (test.ipynb)
+### 早期探索：非侵入式实现 (test.ipynb)
 
 在最终采用 Monkey-Patching 方案之前，我们首先在 note下的`test.ipynb`/`test.py + utils.py` 中尝试了一种**非侵入式**的实现方案。
 
@@ -95,106 +100,136 @@ python main.py test
 
 ---
 
-##  实现原理与优化
+###  实现原理与优化
 
-### 1. 核心算法：Sink + Sliding Window
+#### 1. 核心算法：Sink + Sliding Window
 StreamingLLM 的核心在于保留序列开头的初始 Tokens (Sink) 作为“注意力锚点”，同时仅保留最近的窗口 (Window)。
 
-### 2. Lazy Eviction & Buffer 机制
+#### 2. Lazy Eviction & Buffer 机制
 在 Python/PyTorch 中，如果严格按照StreamingLLM的设计，频繁的张量拼接 (`torch.cat`) 和显存分配开销巨大。为了解决这个问题，我们采用了 **Lazy Eviction** 策略：
 - **Buffer 区**：我们不强制每一步都维持严格的 `window_size`。而是允许 Cache 作为一个 "Buffer" 增长。
 - **批量驱逐**：只有当 Cache 大小超过 `Limit + 64` (Buffer 大小) 时，才触发一次驱逐操作，将大小重置为 `Limit`。
 - **优势**：将昂贵的 Tensor 操作频率降低了几十倍，显著减少了 Python 带来的额外开销。
 
-### 3. 纯 Attention 计时 (Attention Timing Isolation)
+#### 3. 纯 Attention 计时 (Attention Timing Isolation)
 为了在 Python 层面准确验证 StreamingLLM 的 O(1) 复杂度优势（排除 Python 循环和 KV 搬运的干扰），我们在 `pythia_streaming_patch.py` 中实现了针对 Attention 层的**独立计时器**。
 - 通过 `torch.cuda.synchronize()` 确保计时准确。
 - 仅统计 `Forward` 中 Attention 计算的核心耗时，证明了随着序列变长，StreamingLLM 的计算耗时保持恒定。
 
 ---
 
-## 遇到的 Bug 与修复思路
+### 遇到的 Bug 与修复思路
 
 在复现过程中，我遇到并解决了以下问题：
 
-### Bug 1: Cache 已压缩但 PPL 异常爆炸
+#### Bug 1: Cache 已压缩但 PPL 异常爆炸
 **现象**：启用了 Streaming，窗口也限制住了（我检查了chunk间的kv大小，在StreamingLLM中都是符合预期的，也与baseline的前sink+后windows一致），但 PPL 高达 300+（正常应为 40-70）。
 **原因**：**Eager Eviction (急切驱逐)**。最初的实现中，我们在 `update` 时先将新 Token 加入，然后**立即驱逐**旧 Token，并返回驱逐后的 Cache 给当前层计算。这意味着当前步生成的 Token 无法“看到”它刚刚生成的最近几个 Token（因为被切掉了），导致上下文断裂。
 **修复**：改为 **Lazy Eviction**。`update` 函数返回**完整**的 Cache 供当前步计算 Attention，计算完成后（或在准备下一步时）再更新底层的存储状态。这确保了当前步的计算拥有完整的局部上下文。
 
-### Bug 2: ppl计算中，调试日志显示 Cache 尺寸远超 Window Size
+#### Bug 2: ppl计算中，调试日志显示 Cache 尺寸远超 Window Size
 **现象**：设置 Window=256，但日志显示 Cache 增长到了 700 多才变小。
 **原因**：这是 PPL 评估时的 **Chunk-wise Processing** 导致的。为了加速 PPL 计算，我们一次性输入 `chunk_size=512` 个 Token。在处理这个 Chunk 时，Cache 会暂时容纳这些 Token 直到 Chunk 结束才触发驱逐。
 **修复/验证**：
 - 这是一个 Feature 而非 Bug，是为了计算效率的权衡。
 - 在 `debug_test_mechanics` (调试模式) 中，我们将 PPL 测试的 `chunk_size` 调小为 64，从而在日志中清晰地展示出平滑、稳定的驱逐行为 (e.g., `329 -> 264`)，验证了机制的正确性。
 
-### Bug 3: Streaming 速度反而比 Baseline 慢
+#### Bug 3: Streaming 速度反而比 Baseline 慢
 **现象**：理论上 Streaming 是 O(1)，但实测 Python 实现的 Streaming 速度没有显著提升，甚至略慢。
 **原因**：Python 层面的 `torch.cat` 和切片操作带来的 CPU 开销掩盖了 GPU 上的计算节省（特别是在序列长度还不够长，如 < 4k 时）。
 **解决**：
 1. 引入 **Buffer (64 tokens)** 减少 `cat` 频率。
 2. 重点关注 **Avg Attention Time** 指标而非端到端时间。实测显示 Streaming 模式下 Attention 计算时间稳定在 ~0.05ms，而 Baseline 会随长度线性/二次增长，这验证了算法理论上的成功。
 
----
-
-## 评估函数原理
-
-### 1. Chunk-wise Stateful PPL
-为了高效评估长文本 PPL，我们实现了 `evaluate_ppl_unified`：
-- 将长文本切分为多个 Chunk (如 512 或 1024)。
-- 顺序处理每个 Chunk，并传递 `past_key_values`。
-- **动态窗口**：在处理一个 Chunk 期间，Cache 大小会从 `Window` 增长到 `Window + Chunk`。这意味着模型看到的平均上下文长度实际上略大于设定的 `Window Size`，这有助于获得更好的 PPL 结果。
-
-### 2. Speed Benchmark
-- **TTFT (Time to First Token)**: 首字生成延迟。
-- **TPOT (Time per Output Token)**: 生成阶段每 Token 耗时。
-- **Peak Memory**: 显存峰值。StreamingLLM 应能显著降低此指标（在超长文本下）。
-
----
-
-## 实验结果分析
-
-以下结果基于 **Pythia-2.8B** 在 **RTX 4060 Ti (16GB)** 上的实测数据。
-
-### 实验 1: 短序列评估 (Gen Length = 1000)
-**设置**：`ppl_tokens=1000`, `prompt_len=500`, `gen_len=1000`
-
-| Configuration        | Wikitext PPL | PG-19 PPL  | Total Time (s) | Avg Attn (ms)  | TTFT (s)   | TPOT (ms)  | Throughput (tok/s) | Peak Mem (GB) |
-| :---                 | :---         | :---       | :---           | :---           | :---       | :---       | :---               | :---          |
-| **baseline**         | 6.99         | 8.54       | 42.34          | 149.69         | 0.1088     | 42.34      | 23.62              | 5.63          |
-| **streaming_8_256**  | 32.24        | 23.94      | 37.23          | 96.53          | 0.1326     | 37.23      | 26.86              | 5.31          |
-| **streaming_8_512**  | 6.98         | 8.54       | 41.10          | 124.89         | 0.1206     | 41.10      | 24.33              | 5.36          |
-
-### 实验 2: 长序列评估 (Gen Length = 2000)
-**设置**：`ppl_tokens=2000`, `prompt_len=500`, `gen_len=2000`
-
+#### Bug 4: RoPE 绝对位置与物理 Cache 维度的核心冲突
+**现象**：出现ppl爆炸
 | Configuration        | Wikitext PPL | PG-19 PPL  | Total Time (s) | Avg Attn (ms)  | TTFT (s)   | TPOT (ms)  | Throughput (tok/s) | Peak Mem (GB) |
 | :---                 | :---         | :---       | :---           | :---           | :---       | :---       | :---               | :---          |
 | **baseline**         | 7.97         | 8.63       | 77.87          | 164.49         | 0.1092     | 38.93      | 25.69              | 5.94          |
 | **streaming_8_256**  | 71.67        | 47.12      | 63.56          | 73.19          | 0.1216     | 31.78      | 31.47              | 5.31          |
 | **streaming_8_512**  | 41.28        | 35.22      | 66.71          | 94.64          | 0.1183     | 33.36      | 29.98              | 5.36          |
 
+在引入 `chunk_size > 1` (如 Chunked Prefill) 时，ppl计算速度大幅增加，但ppl突然增大，其原因涉及我们侵入式的底层原理：我们直接对kv cache进行了切片，这时候原来判断cache长度的函数就会失效，即`get_seq_length`返回的是物理长度，而不是逻辑长度。这会导致RoPE计算错误，从而导致ppl增大。而我们第一版实现中修改了`get_seq_length`函数，使其返回逻辑长度。但这也引入了第二个问题：`attn_mask`错误,因为模型误把逻辑长度理解成了现有缓存长度，而这远大于当前所有的kv长度（缓存+新输入的），所以所有token都变成了可见
+
+例：chunksize为10，window=10，sink=10时，理论上我们处理第31个token时他应该只能看到0~10以及21~30这20个token，可由于`get_seq_length`已知现在在第三十个token，而加上新输入的10个token后总的kv也才30（因为有10个被裁掉了），所以模型会错误地认为当前token可以看到所有token（即他看到了0~10以及21~30这30个token）。
+
+因此系统面临两难困境：
+1.  **保 RoPE**：如果让 `get_seq_length` 返回真实的逻辑长度 (e.g., 1000) 以确保 RoPE 计算正确的旋转角度，HuggingFace 的默认逻辑会生成一个 `[1, 1, 10, 1000]` 的巨大 Mask，与此时仅有 `24` (Sink+Window) 长度的物理 KV Cache 发生维度不匹配报错。
+2.  **保 Mask**：如果让 `get_seq_length` 返回物理长度 (e.g., 24) 以适配矩阵乘法，RoPE 会错误地将当前 Token 当作序列开头的 Token (位置 0-23)，彻底破坏长文本的位置信息。
+
+显然后者严重性低一些，因为他只影响批量验证（对于逐token生成，因为每次都只有一个token，所以mask正常情况下也都是True，不会有问题）
+
+**排查方式**：
+- 建立了独立的 `debug_streaming` 环境，复刻了 `main.py` 和 `patch` 逻辑。
+- 在 `Attention.forward` 中植入探针，打印 Query, Key, Mask 的 Shape 以及 `get_seq_length` 的返回值。
+- 观察到当 `Chunk Size=10` 时，逻辑长度 (30) 与物理 Key 长度 (24) 的脱节导致了 Mask 维度的各种异常。
+
+**解决方案**：**“逻辑与物理分离”**
+1.  **RoPE 层面**：坚持让 `get_seq_length` 返回**逻辑长度** (Logical Length)，确保 RoPE 拿到绝对位置索引，保证旋转正确。
+2.  **Mask 层面**：**弃用 Transformers 默认 Mask 生成逻辑**。
+3.  **手动构建 Mask**：在 Patch 代码中，基于物理 Cache 的结构 (Sink + Window + Current Chunk) 手动构建一个形状为 `[Batch, 1, Chunk_Len, Physical_Cache_Len]` 的 Mask。
+    - 确保当前 Token 只能看到 Sink 区、Window 区以及 Chunk 内部它之前的 Token。
+    - 这种方案完美调和了 RoPE 对“绝对位置”的需求和 Attention 计算对“物理维度”的限制。
+
+---
+
+### 评估函数原理
+
+#### 1. Chunk-wise Stateful PPL
+为了高效评估长文本 PPL，我们实现了 `evaluate_ppl_unified`：
+- 将长文本切分为多个 Chunk (128)。
+- 顺序处理每个 Chunk，并传递 `past_key_values`。
+- **动态窗口**：在处理一个 Chunk 期间，Cache 大小会从 `Window` 增长到 `Window + Chunk`。这意味着模型看到的平均上下文长度实际上略大于设定的 `Window Size`，这有助于获得更好且更快的 PPL 结果。
+
+#### 2. Speed Benchmark
+- **TTFT (Time to First Token)**: 首字生成延迟。
+- **TPOT (Time per Output Token)**: 生成阶段每 Token 耗时。
+- **Peak Memory**: 显存峰值。StreamingLLM 应能显著降低此指标（在超长文本下）。
+
+---
+
+### 实验结果分析
+
+以下结果基于 **Pythia-2.8B** 在 **RTX 4060 Ti (16GB)** 上的实测数据。考虑到模型训练长度限制，评估控制在 2048 tokens 以内。
+
+#### 实验 1: 短序列评估
+**设置**：`ppl_tokens=1000`, `prompt_len=500`, `gen_len=500`
+
+| Configuration | Wikitext PPL | PG-19 PPL | Total Time (s) | Avg Attn (ms) | TTFT (s) | TPOT (ms) | Throughput (tok/s) | Peak Mem (GB) |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Baseline** | 6.97 | 8.57 | 18.06 | 0.1159 | 0.1158 | 36.12 | 27.69 | 5.48 |
+| **Streaming (Win=256)** | 11.49 | 8.70 | 17.03 | 0.0847 | 0.1191 | 34.07 | 29.35 | 5.31 |
+| **Streaming (Win=512)** | 7.72 | 8.52 | 17.88 | **0.0899** | 0.1225 | 35.76 | **29.18** | 5.37 |
+
+*(注：Streaming 模式的 Avg Attn 已经过最新优化，通过跳过 Decoding 阶段的 Mask 构建，实现了 ~90us 的极速 Attention)*
+
+#### 实验 2: 长序列评估
+**设置**：`ppl_tokens=2000`, `prompt_len=500`, `gen_len=1500`
+
+| Configuration | Wikitext PPL | PG-19 PPL | Total Time (s) | Avg Attn (ms) | TTFT (s) | TPOT (ms) | Throughput (tok/s) | Peak Mem (GB) |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Baseline** | 7.96 | 8.66 | 57.20 | 0.1508 | 0.1126 | 38.13 | 26.22 | 5.79 |
+| **Streaming (Win=256)** | 12.39 | 8.87 | 61.31 | 0.0993 | 0.1278 | 40.88 | 24.46 | 5.31 |
+| **Streaming (Win=512)** | 9.46 | 8.70 | 56.22 | 0.1128 | 0.1272 | 37.48 | 26.68 | 5.37 |
+
 ### 结果深度分析
 
 #### 1. 速度与计算开销 (Speed & Computation)
-*   **Attention 计算时间 (Avg Attn Time)**：
-    *   这是验证 StreamingLLM 核心价值的最关键指标。
-    *   在生成 2000 tokens 时，**Baseline** 的平均 Attention 耗时为 **164.49 ms**，而 **Streaming (Window=256)** 仅为 **73.19 ms**，减少了 **55%** 以上。
-    *   这直接证明了 StreamingLLM 将 Attention 计算复杂度从随长度增长限制为 O(1) 常数级（取决于 Window Size）。
-*   **总生成时间 (Total Time)**：
-    *   在短序列 (1000 tokens) 下，Streaming 的优势不明显，甚至与 Baseline 持平，这是因为 Python 层面的 KV Cache 搬运（Slice & Cat）开销抵消了 Attention 的计算收益。
-    *   在长序列 (2000 tokens) 下，Streaming 的优势开始显现 (77.87s vs 63.56s)，提升了约 **18%** 的端到端速度。随着序列继续增长，Baseline 将因 O(N^2) 复杂度而显著变慢，而 Streaming 将保持稳定速度。
+*   **真正的 O(1) Attention**：
+    *   最新的优化（Decoding 阶段跳过 Mask 构建）解决了早期实现中 Avg Attn 偏高的问题。
+    *   在短序列实验中，Streaming (Win=512) 的 **Avg Attn Time (0.0899 ms)** 显著低于 Baseline (**0.1159 ms**)，降幅达 **22%**。
+    *   这证明了 StreamingLLM 不仅理论上是 O(1)，在工程上也成功实现了比 Eager 模式更快的单步计算速度。
+*   **端到端性能 (Total Time)**：
+    *   得益于更快的 Attention 和轻量的 Cache 管理，StreamingLLM 在短序列下的 **Throughput (29.18 tok/s)** 也成功反超了 Baseline (27.69 tok/s)。
+    *   在长序列下，虽然 Python 层面的 KV 搬运开销仍有一定影响，但随着长度进一步增加，Baseline 的 O(N^2) 瓶颈将导致其速度急剧下降，而 StreamingLLM 将保持恒定高速。
 
 #### 2. 模型质量 (PPL / Quality)
 *   **Window Size 的权衡**：
-    *   **Window=256**：PPL 显著恶化 (Wikitext 7.97 -> 71.67)。这说明 256 的窗口对于 Pythia-2.8B 来说太小，丢失了过多的上下文信息。
-    *   **Window=512**：在短序列 (1000 tokens) 下，其 PPL (6.98) 几乎与 Baseline (6.99) 一致，证明了 "Sink + 近期窗口" 能保留大部分关键信息。但在长序列下 PPL 仍有上升 (7.97 -> 41.28)，提示我们对于更长的依赖可能需要更大的窗口或更好的驱逐策略。
-*   **结论**：在实际应用中，建议使用更大的窗口 (如 1024 或 2048) 以在保持流式生成能力的同时维持较低的 PPL。
+    *   **Window=256**：PPL 明显恶化 (Wikitext 6.97 -> 11.49)，说明 256 窗口对于 Pythia-2.8B 过小，丢失了关键上下文。
+    *   **Window=512**：PPL 表现优异。在短序列上 (6.97 vs 7.72) 差距很小，在 PG-19 数据集上甚至略优 (8.57 vs 8.52)。这有力地证明了 "Sink + Sliding Window" 策略能够有效捕获长文本的核心语义。
 
 #### 3. 显存占用 (Memory Usage)
-*   StreamingLLM 成功限制了显存增长。
-*   在 2000 tokens 时，Baseline 占用 **5.94 GB**，而 Streaming 稳定在 **5.31 GB**。
-*   虽然在 2K 长度下差距仅 0.6 GB，但在无限流式生成场景中，Baseline 显存会线性爆炸直至 OOM，而 Streaming 将永远保持在 5.3 GB 左右。
+*   StreamingLLM 成功将显存锁定。在 2000 tokens 生成中，显存稳定在 **5.3 GB** 左右，而 Baseline 已经增长到 **5.79 GB**。对于无限长度生成，Baseline 必然 OOM，而 StreamingLLM 将永远稳定运行。
 
 
+## 团队完成部分说明
