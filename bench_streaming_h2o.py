@@ -4,6 +4,7 @@ import time
 import math
 import gc
 import sys
+import subprocess
 from datasets import load_dataset
 import datasets
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -72,63 +73,119 @@ def load_long_text(dataset_name="wikitext", split="test", limit_chars=50000):
     return text[:limit_chars]
 
 
-def evaluate_ppl_unified(
-    model, tokenizer, text: str, max_tokens: int = 2000, chunk_size: int = 512
+def calculate_ppl(
+    model, tokenizer, text, max_tokens=1000, use_kv_cache=True, debug=False
 ):
     """
-    统一的 PPL 评估函数，支持 Baseline 和 StreamingLLM。
-    使用分块处理 (chunk-wise) 来模拟流式输入或滑动窗口。
+    计算困惑度 (PPL)
+
+    Args:
+        model: 模型
+        tokenizer: 分词器
+        text: 输入文本
+        max_tokens: 最大测试长度
+        use_kv_cache: 是否使用 KV Cache（True 时逐 token 生成，能真实反映压缩影响）
+        debug: 是否打印调试信息
     """
     encodings = tokenizer(text, return_tensors="pt")
-    input_ids = encodings.input_ids[:, :max_tokens].to(model.device)
-    seq_len = input_ids.size(1)
-
+    seq_len = encodings.input_ids.size(1)
     nlls = []
-    token_counts = []
-    past_key_values = None
+    prev_end_loc = 0
 
-    # print(f"  > PPL 评估: {seq_len} tokens, chunk_size={chunk_size}")
+    # 限制最大测试长度
+    max_test_len = min(seq_len, max_tokens)
 
-    for i in range(0, seq_len, chunk_size):
-        chunk_input_ids = input_ids[:, i : i + chunk_size]
-        chunk_target = chunk_input_ids.clone()
+    if debug:
+        print(f"    [DEBUG] 原始序列长度: {seq_len}, 测试长度: {max_test_len}")
 
-        position_ids = torch.arange(
-            i,
-            i + chunk_input_ids.size(1),
-            dtype=torch.long,
-            device=chunk_input_ids.device,
-        )
-        position_ids = position_ids.unsqueeze(0)
+    if not use_kv_cache:
+        # 快速模式：滑动窗口方式（不反映压缩影响）
+        stride = 512
+        MAX_LENGTH = 2048
 
-        with torch.no_grad():
-            outputs = model(
-                chunk_input_ids,
-                labels=chunk_target,
-                past_key_values=past_key_values,
-                position_ids=position_ids,
-                use_cache=True,
-            )
+        for begin_loc in range(0, max_test_len, stride):
+            end_loc = min(begin_loc + MAX_LENGTH, seq_len)
+            trg_len = end_loc - prev_end_loc
+            input_ids = encodings.input_ids[:, begin_loc:end_loc].to(device)
+            target_ids = input_ids.clone()
+            target_ids[:, :-trg_len] = -100
 
-            loss = outputs.loss
-            past_key_values = outputs.past_key_values
+            with torch.no_grad():
+                outputs = model(input_ids, labels=target_ids)
+                neg_log_likelihood = outputs.loss * trg_len
 
-            # StreamingLLM: 手动触发驱逐以在 PPL 评估期间模拟窗口限制
-            if hasattr(past_key_values, "evict_all_layers"):
-                past_key_values.evict_all_layers()
+            nlls.append(neg_log_likelihood)
+            prev_end_loc = end_loc
+            if end_loc == max_test_len:
+                break
+    else:
+        # 生成式 PPL 计算（逐 token，累积 past_key_values）
+        # 这样 StreamingLLM/H2O 的压缩会真正影响后续预测
+        input_ids = encodings.input_ids[:, :max_test_len].to(device)
+        past_key_values = None
 
-            if torch.isnan(loss) or torch.isinf(loss):
-                continue
+        eviction_count = 0
+        cache_sizes = []
+        cache_type_detected = False
 
-            nlls.append(loss)
-            token_counts.append(chunk_input_ids.size(1))
+        # 逐 token 预测：用 token[0:i] 预测 token[i]
+        for i in range(1, input_ids.size(1)):
+            with torch.no_grad():
+                # 输入当前 token[i-1]（配合之前的 past_kv）
+                current_input = input_ids[:, i - 1 : i]
+
+                outputs = model(
+                    current_input,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                    return_dict=True,
+                )
+
+                # 诊断：检测 cache 类型
+                if not cache_type_detected and outputs.past_key_values is not None:
+                    cache_class = type(outputs.past_key_values).__name__
+                    if debug:
+                        print(f"    [DEBUG] Cache 类型: {cache_class}")
+                    cache_type_detected = True
+
+                # 预测 token[i]
+                logits = outputs.logits[:, -1, :]  # [batch, vocab_size]
+                target = input_ids[:, i]  # [batch]
+
+                # 计算 loss
+                loss = torch.nn.functional.cross_entropy(logits, target)
+                nlls.append(loss)
+
+                # 更新 past_key_values（会被 StreamingLLM/H2O 压缩！）
+                past_key_values = outputs.past_key_values
+
+                # 记录实际 cache 大小（不是累计 token 数）
+                if past_key_values is not None and hasattr(past_key_values, "layers"):
+                    if len(past_key_values.layers) > 0 and hasattr(
+                        past_key_values.layers[0], "keys"
+                    ):
+                        actual_cache_size = past_key_values.layers[0].keys.shape[-2]
+                        cache_sizes.append(actual_cache_size)
+
+                # H2O/StreamingLLM: 手动触发驱逐
+                if hasattr(past_key_values, "evict_all_layers"):
+                    past_key_values.evict_all_layers()
+                    eviction_count += 1
+
+        if debug:
+            print(f"    [DEBUG] 触发驱逐次数: {eviction_count}")
+            if cache_sizes:
+                print(
+                    f"    [DEBUG] Cache 大小范围: {min(cache_sizes)} ~ {max(cache_sizes)}, 平均: {sum(cache_sizes)/len(cache_sizes):.1f}"
+                )
+
+        prev_end_loc = input_ids.size(1) - 1
 
     if not nlls:
         return float("inf")
 
-    total_loss = sum(l * c for l, c in zip(nlls, token_counts))
-    total_tokens = sum(token_counts)
-    return torch.exp(total_loss / total_tokens).item()
+    ppl = torch.exp(torch.stack(nlls).sum() / prev_end_loc)
+    return ppl.item()
 
 
 def benchmark_generation_speed(model, tokenizer, prompt, num_tokens=500, verbose=False):
@@ -209,17 +266,17 @@ def print_results_table(results):
     """打印 Markdown 格式的结果表格"""
     print("\n" + "=" * 160)
     print(
-        f"| {'Configuration':<20} | {'Wikitext PPL':<12} | {'PG-19 PPL':<10} | {'Total Time (s)':<14} | {'Avg Attn (ms)':<14} | {'TTFT (s)':<10} | {'TPOT (ms)':<10} | {'Throughput (tok/s)':<18} | {'Peak Mem (GB)':<13} |"
+        f"| {'Configuration':<20} | {'Wikitext PPL':<14} | {'PG-19 PPL':<12} | {'Total Time (s)':<14} | {'Avg Attn (ms)':<14} | {'TTFT (s)':<10} | {'TPOT (ms)':<10} | {'Throughput (tok/s)':<18} | {'Peak Mem (GB)':<13} |"
     )
     print(
-        f"| {':---':<20} | {':---':<12} | {':---':<10} | {':---':<14} | {':---':<14} | {':---':<10} | {':---':<10} | {':---':<18} | {':---':<13} |"
+        f"| {':---':<20} | {':---':<14} | {':---':<12} | {':---':<14} | {':---':<14} | {':---':<10} | {':---':<10} | {':---':<18} | {':---':<13} |"
     )
 
     for row in results:
         print(
             f"| {row['name']:<20} | "
-            f"{row['wiki_ppl']:<12.2f} | "
-            f"{row['pg19_ppl']:<10.2f} | "
+            f"{row['wiki_ppl']:<14.4f} | "
+            f"{row['pg19_ppl']:<12.4f} | "
             f"{row['total_time']:<14.4f} | "
             f"{row['avg_attn']:<14.4f} | "
             f"{row['ttft']:<10.4f} | "
@@ -250,9 +307,10 @@ def run_standard_benchmark():
     for config in configs:
         print(f"\n正在运行配置: {config['name']} ...")
 
-        # 1. 应用配置
+        # 1. 应用配置 - 先完全清理之前的配置！
+        disable_streaming_llm(model)  # 清理所有之前的 patch 和配置
+
         if config["type"] == "baseline":
-            disable_streaming_llm(model)  # 确保移除之前的 patch
             patch_attention_layers(model)  # 仅 patch 计时器
         elif config["type"] == "streaming":
             enable_streaming_llm(
@@ -267,20 +325,47 @@ def run_standard_benchmark():
                 debug=False,
             )
 
+        # 强制清理 GPU 缓存和内存
         torch.cuda.empty_cache()
+        torch.cuda.synchronize()
         gc.collect()
 
-        # 2. PPL 测试
-        # 对于 H2O，使用 capacity 作为 chunk_size
-        if config["type"] == "h2o":
-            chunk_size = config.get("capacity", 256)
-        else:
-            chunk_size = config.get("window", 1024)  # Baseline 默认 chunk 1024
-        wiki_ppl = evaluate_ppl_unified(
-            model, tokenizer, wiki_text, max_tokens=ppl_tokens, chunk_size=chunk_size
+        # 获取 GPU 温度和功率（用于诊断性能波动）
+        try:
+            result = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=temperature.gpu,power.draw,clocks.gr",
+                    "--format=csv,noheader,nounits",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            if result.returncode == 0:
+                temp, power, clock = result.stdout.strip().split(", ")
+                print(f"    [GPU状态] 温度: {temp}°C, 功率: {power}W, 频率: {clock}MHz")
+        except:
+            pass
+
+        # 2. PPL 测试（使用生成式计算，准确反映压缩影响）
+        print(f"    正在计算 WikiText PPL...")
+        wiki_ppl = calculate_ppl(
+            model,
+            tokenizer,
+            wiki_text,
+            max_tokens=ppl_tokens,
+            use_kv_cache=True,
+            debug=True,
         )
-        pg19_ppl = evaluate_ppl_unified(
-            model, tokenizer, pg19_text, max_tokens=ppl_tokens, chunk_size=chunk_size
+        print(f"    正在计算 PG-19 PPL...")
+        pg19_ppl = calculate_ppl(
+            model,
+            tokenizer,
+            pg19_text,
+            max_tokens=ppl_tokens,
+            use_kv_cache=True,
+            debug=True,
         )
 
         # 3. 速度测试
@@ -305,7 +390,7 @@ def run_standard_benchmark():
         )
 
         print(
-            f"  -> 完成。 Wiki PPL: {wiki_ppl:.2f}, Throughput: {speed_metrics['Throughput (tok/s)']:.2f} tok/s"
+            f"  -> 完成。 Wiki PPL: {wiki_ppl:.4f}, Throughput: {speed_metrics['Throughput (tok/s)']:.2f} tok/s"
         )
 
     # 打印最终表格
@@ -333,23 +418,16 @@ def debug_test_mechanics():
     print(" StreamingLLM enabled successfully.")
 
     # 1. Wikitext PPL (简略版，只跑少量 tokens 展示机制)
-    print("   [Eval] Wikitext PPL (Limit 2000 tokens)...")
+    print("   [Eval] Wikitext PPL (Limit 1000 tokens)...")
     # 加载一小段文本用于演示
     wiki_text = load_long_text("wikitext", limit_chars=5000)
-    # 为了演示 PPL 计算中的 evict，我们调用 evaluate_ppl_unified
-    # 注意：为了让 debug 信息打印出来，我们需要确保 evaluate_ppl_unified 内部会触发 update
-    # 使用较小的 chunk_size (64) 来展示更频繁的 eviction 和更稳定的缓存大小，避免出现 752 -> 264 的大跳变
-    ppl = evaluate_ppl_unified(
-        model, tokenizer, wiki_text, max_tokens=1000, chunk_size=64
-    )
+    ppl = calculate_ppl(model, tokenizer, wiki_text, max_tokens=1000, use_kv_cache=True)
     print(f"     -> PPL: {ppl:.4f}")
 
     # 2. PG19 PPL
-    print("   [Eval] PG19 PPL (Limit 2000 tokens)...")
+    print("   [Eval] PG19 PPL (Limit 1000 tokens)...")
     pg19_text = load_long_text("pg19", limit_chars=5000)
-    ppl = evaluate_ppl_unified(
-        model, tokenizer, pg19_text, max_tokens=1000, chunk_size=64
-    )
+    ppl = calculate_ppl(model, tokenizer, pg19_text, max_tokens=1000, use_kv_cache=True)
     print(f"    -> PPL: {ppl:.4f}")
 
     # 3. Speed Test
