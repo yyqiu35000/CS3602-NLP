@@ -20,14 +20,10 @@ from pythia_streaming_h2o_patch import (
     get_attention_stats,
 )
 
-# 配置环境
-os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-current_dir = os.getcwd()
-os.environ["HF_HOME"] = os.path.join(current_dir, "hf_cache")
-os.environ["HF_DATASETS_OFFLINE"] = "1"
-datasets.config.HF_DATASETS_OFFLINE = True
+# HuggingFace 配置（可选：设置镜像加速）
+# os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
-model_id = "./models/pythia-2.8b"
+model_id = "EleutherAI/pythia-2.8b"
 device = "cuda"
 
 
@@ -35,18 +31,10 @@ def load_long_text_for_stress_test(target_length=10000):
     """加载并拼接文本，达到目标长度"""
     print(f"正在准备长度为 {target_length} tokens 的测试文本...")
 
-    # 加载 wikitext
-    arrow_file = os.path.join(
-        current_dir,
-        "hf_cache",
-        "datasets",
-        "wikitext",
-        "wikitext-2-raw-v1",
-        "0.0.0",
-        "b08601e04326c79dfdd32d625aee71d232d685c3",
-        "wikitext-test.arrow",
-    )
-    ds = datasets.Dataset.from_file(arrow_file)
+    # 从 HuggingFace 加载 wikitext
+    from datasets import load_dataset
+
+    ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
     text = "\n\n".join(ds["text"])
 
     # 如果不够长，重复拼接

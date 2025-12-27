@@ -1,11 +1,9 @@
-import os
 import torch
 import time
 import math
 import gc
 import sys
 from datasets import load_dataset
-import datasets
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from pythia_streaming_patch import (
     enable_streaming_llm,
@@ -18,21 +16,12 @@ from pythia_streaming_patch import (
     get_raw_attention_times,
 )
 
-# 配置 HuggingFace 镜像和缓存路径（使用本地已下载的资源）
-os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-current_dir = os.getcwd()
-os.environ["HF_HOME"] = os.path.join(current_dir, "hf_cache")
-# 设置离线模式，强制使用本地缓存
-os.environ["HF_DATASETS_OFFLINE"] = "1"
-datasets.config.HF_DATASETS_OFFLINE = True
-
 configs = [
     {"name": "baseline", "type": "baseline"},
     {"name": "streaming_8_256", "type": "streaming", "sink": 8, "window": 256},
     {"name": "streaming_8_512", "type": "streaming", "sink": 8, "window": 512},
 ]
-# 使用本地模型路径
-model_id = "./models/pythia-2.8b"
+model_id = "EleutherAI/pythia-2.8b"
 device = "cuda"
 ppl_tokens = 1000
 speed_tokens = 500
@@ -40,45 +29,16 @@ Pre_tokens = 500
 
 
 def load_long_text(dataset_name="wikitext", split="test", limit_chars=50000):
-    """直接从本地 arrow 文件加载数据集，完全离线"""
+    """加载wiki/pg19文本用于测试"""
     print(f"正在加载 {dataset_name}...")
     try:
         if dataset_name == "wikitext":
-            # 直接从 arrow 文件加载，不触发任何网络请求
-            arrow_file = os.path.join(
-                current_dir,
-                "hf_cache",
-                "datasets",
-                "wikitext",
-                "wikitext-2-raw-v1",
-                "0.0.0",
-                "b08601e04326c79dfdd32d625aee71d232d685c3",
-                f"wikitext-{split}.arrow",
-            )
-            if not os.path.exists(arrow_file):
-                raise FileNotFoundError(f"Arrow file not found: {arrow_file}")
-
-            ds = datasets.Dataset.from_file(arrow_file)
+            ds = load_dataset("wikitext", "wikitext-2-raw-v1", split=split)
             text = "\n\n".join(ds["text"])
-            print(f"  -> 成功从本地加载 {len(ds)} 条记录")
-
         elif dataset_name == "pg19":
-            # 从下载的 PG-19 sample 文件加载
-            pg19_sample_path = os.path.join(
-                current_dir, "hf_cache", "datasets", "pg19_sample", "pg19_sample.txt"
-            )
-
-            if not os.path.exists(pg19_sample_path):
-                raise FileNotFoundError(
-                    f"未找到 PG-19 本地文本文件。\n"
-                    f"请先运行: python download_pg19_sample.py"
-                )
-
-            with open(pg19_sample_path, "r", encoding="utf-8") as f:
-                text = f.read()
-
-            file_size = os.path.getsize(pg19_sample_path)
-            print(f"  -> 成功从本地加载 PG-19 sample ({file_size / 1024:.1f} KB)")
+            ds = load_dataset("pg19", split=split, streaming=True)
+            sample = next(iter(ds))
+            text = sample["text"]
         else:
             text = "Long text placeholder. " * 1000
     except Exception as e:
@@ -262,7 +222,9 @@ def run_standard_benchmark():
     # 加载数据
     wiki_text = load_long_text("wikitext", limit_chars=50000)
     pg19_text = load_long_text("pg19", limit_chars=50000)
+    import pdb
 
+    pdb.set_trace()
     results = []
 
     for config in configs:
@@ -325,8 +287,7 @@ def debug_test_mechanics():
     print("=" * 60)
     print("   [Mode] StreamingLLM (Sink=8, Window=256)")
 
-    # 使用本地模型路径（和主程序一致）
-    model_id = "./models/pythia-2.8b"
+    model_id = "EleutherAI/pythia-160m"
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     model = AutoModelForCausalLM.from_pretrained(
         model_id, dtype=torch.float16, device_map="cuda"
