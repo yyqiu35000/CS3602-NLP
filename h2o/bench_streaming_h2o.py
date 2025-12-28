@@ -24,14 +24,13 @@ from pythia_streaming_h2o_patch import (
 # os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
 configs = [
-    {"name": "baseline", "type": "baseline"},
-    {"name": "streaming_8_256", "type": "streaming", "sink": 8, "window": 256},
+    # {"name": "baseline", "type": "baseline"},
+    # {"name": "streaming_8_256", "type": "streaming", "sink": 8, "window": 256},
     {"name": "streaming_8_512", "type": "streaming", "sink": 8, "window": 512},
-    # H2O 配置：max_capacity=256, 其中 4 个 Sink + 32 个 Recent + 220 个 Heavy Hitters
-    {"name": "h2o_4_32_256", "type": "h2o", "sink": 4, "recent": 32, "capacity": 256},
-    {"name": "h2o_8_32_256", "type": "h2o", "sink": 8, "recent": 32, "capacity": 256},
+    # H2O 配置：max_capacity=264, 其中 4 个 Sink + 32 个 Recent + 220 个 Heavy Hitters
+    # {"name": "h2o_4_32_256", "type": "h2o", "sink": 8, "recent": 32, "capacity": 264},
     # 更大容量的 H2O 配置
-    {"name": "h2o_8_64_512", "type": "h2o", "sink": 8, "recent": 64, "capacity": 512},
+    {"name": "h2o_8_64_512", "type": "h2o", "sink": 8, "recent": 64, "capacity": 520},
 ]
 # 使用 HuggingFace 模型
 model_id = "EleutherAI/pythia-2.8b"

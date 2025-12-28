@@ -669,7 +669,7 @@ def unpatch_attention_layers_innovations(model):
 def enable_innovation_llm(
     model: GPTNeoXForCausalLM, 
     tokenizer=None,
-    method="heavy_hitter", # or "pos_aware", "semantic_block"
+    method="semantic_block", # or "pos_aware"
     n_sink=4, 
     window_size=256, 
     extra_size=128, # heavy_size or semantic_size

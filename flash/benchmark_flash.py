@@ -3,16 +3,13 @@ import time
 import math
 import gc
 import sys
-import copy
-from datasets import load_dataset
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModelForCausalLM
-import torch.nn.functional as F
-
-# Add project root to sys.path to import modules
 import os
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from datasets import load_dataset
+from transformers import AutoTokenizer, AutoModelForCausalLM
 
-# Import existing streaming patch
+# Add current directory to sys.path to ensure we import the local patch
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
 from pythia_streaming_patch import (
     enable_streaming_llm, 
     disable_streaming_llm, 
@@ -21,33 +18,28 @@ from pythia_streaming_patch import (
     disable_attention_timing_collection, 
     get_attention_stats,
     patch_attention_layers,
-    get_raw_attention_times,
-    StreamingDynamicCache as PyramidStreamingCache
+    get_raw_attention_times
 )
-from pythia_streaming_flash import enable_streaming_flash_attn
 
-# ==========================================
-# Benchmark Logic
-# ==========================================
-
+# Configuration
 configs = [
-        # {"name": "Baseline (Eager)", "type": "baseline"},
-        {"name": "StreamingLLM", "type": "streaming", "sink": 8, "window": 512},
-        {"name": "StreamingLLM + FlashAttn", "type": "streaming_flash_attn", "sink": 8, "window": 512},
-    ]
+    {"name": "Baseline", "type": "baseline"},
+    {"name": "StreamingLLM", "type": "streaming", "sink": 8, "window": 256},
+]
+
+# Attention implementations to test
+# Note: "sdpa" requires PyTorch 2.0+ and compatible hardware
+attn_impls = ["eager", "sdpa"]
 
 model_id = "EleutherAI/pythia-2.8b" 
 device = "cuda"
 ppl_tokens = 1000
-speed_tokens = 1000
-pre_tokens = 500
-
-def print_flush(msg, end="\n"):
-    print(msg, end=end, flush=True)
+speed_tokens = 500
+Pre_tokens = 500
 
 def load_long_text(dataset_name="wikitext", split="test", limit_chars=50000):
     """加载wiki/pg19文本用于测试"""
-    print_flush(f"正在加载 {dataset_name}...")
+    print(f"正在加载 {dataset_name}...")
     try:
         if dataset_name == "wikitext":
             ds = load_dataset("wikitext", "wikitext-2-raw-v1", split=split)
@@ -79,12 +71,7 @@ def evaluate_ppl_unified(model, tokenizer, text: str, max_tokens: int = 2000, ch
     token_counts = [] 
     past_key_values = None 
     
-    print_flush(f"  > PPL 评估: {seq_len} tokens, chunk_size={chunk_size}")
-    
     for i in range(0, seq_len, chunk_size):
-        if i % (chunk_size * 5) == 0:
-            print_flush(".", end="")
-        
         chunk_input_ids = input_ids[:, i : i + chunk_size]
         chunk_target = chunk_input_ids.clone()
         
@@ -167,113 +154,116 @@ def benchmark_generation_speed(model, tokenizer, prompt, num_tokens=500, verbose
     tpot = (total_time / actual_tokens * 1000) if actual_tokens > 0 else 0
     
     if verbose:
-         print_flush(f"   Avg Attention Time: {stats_mean*1000:.4f} us +/- {stats_std*1000:.4f} us")
-         print_flush(f"   Actual generated: {actual_tokens} tokens, Peak Memory: {peak_mem:.4f} GB")
+         print(f"   Avg Attention Time: {stats_mean*1000:.4f} ms +/- {stats_std*1000:.4f}")
+         print(f"   Actual generated: {actual_tokens} tokens, Peak Memory: {peak_mem:.4f} GB")
 
     return {
         "TTFT (s)": ttft,
         "Total Time (s)": total_time,
         "TPOT (ms)": tpot,
         "Throughput (tok/s)": throughput,
-        "Avg Attn (ms)": avg_attn,
+        "Avg Attn (ms)": avg_attn * 1000,
         "Peak Mem (GB)": peak_mem
     }
 
 def print_results_table(results):
     """打印 Markdown 格式的结果表格"""
-    print("\n" + "="*160)
-    print(f"| {'Configuration':<24} | {'Wikitext PPL':<12} | {'PG-19 PPL':<10} | {'Total Time (s)':<14} | {'Avg Attn (ms)':<14} | {'TTFT (s)':<10} | {'TPOT (ms)':<10} | {'Throughput (tok/s)':<18} | {'Peak Mem (GB)':<13} |")
-    print(f"| {':---':<24} | {':---':<12} | {':---':<10} | {':---':<14} | {':---':<14} | {':---':<10} | {':---':<10} | {':---':<18} | {':---':<13} |")
+    print("\n" + "="*180)
+    print(f"| {'Configuration':<30} | {'Attn Impl':<10} | {'Wikitext PPL':<12} | {'PG-19 PPL':<10} | {'Total Time (s)':<14} | {'Avg Attn (ms)':<14} | {'TTFT (s)':<10} | {'TPOT (ms)':<10} | {'Throughput':<12} | {'Peak Mem (GB)':<13} |")
+    print(f"| {':---':<30} | {':---':<10} | {':---':<12} | {':---':<10} | {':---':<14} | {':---':<14} | {':---':<10} | {':---':<10} | {':---':<12} | {':---':<13} |")
     
     for row in results:
-        print(f"| {row['name']:<24} | "
+        print(f"| {row['name']:<30} | "
+              f"{row['attn']:<10} | "
               f"{row['wiki_ppl']:<12.2f} | "
               f"{row['pg19_ppl']:<10.2f} | "
               f"{row['total_time']:<14.4f} | "
               f"{row['avg_attn']:<14.4f} | "
               f"{row['ttft']:<10.4f} | "
               f"{row['tpot']:<10.2f} | "
-              f"{row['throughput']:<18.2f} | "
+              f"{row['throughput']:<12.2f} | "
               f"{row['peak_mem']:<13.2f} |")
-    print("="*160 + "\n")
+    print("="*180 + "\n")
 
-def run_comprehensive_benchmark():
-    print("Starting Comprehensive Benchmark...")
-    results = []
+def run_benchmark():
+    print(f"Starting Flash Benchmark for model: {model_id}")
     
-    # 初始化模型
-    print(f"正在加载模型: {model_id}")
-    # Important: Flash Attention (SDPA) usually requires float16/bfloat16
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
-    model = AutoModelForCausalLM.from_pretrained(model_id, dtype=torch.float16, device_map=device)
-    
-    # 加载数据
+    # Pre-load data
     wiki_text = load_long_text("wikitext", limit_chars=50000)
     pg19_text = load_long_text("pg19", limit_chars=50000)
     
-    for config in configs:
-        print(f"\n>>> Running Configuration: {config['name']}")
+    results = []
+    
+    for attn_impl in attn_impls:
+        print(f"\n{'='*40}")
+        print(f" Testing with Attention Implementation: {attn_impl.upper()}")
+        print(f"{'='*40}")
         
-        # 1. Setup Environment
-        # Reload model to ensure clean state for patching/unpatching
-        del model
-        torch.cuda.empty_cache()
-        gc.collect()
-        
-        model = AutoModelForCausalLM.from_pretrained(model_id, dtype=torch.float16, device_map=device)
-        
-        if config["type"] == "baseline":
-            disable_streaming_llm(model)
-            patch_attention_layers(model) # 仅 patch 计时器
-            
-        elif config["type"] == "streaming":
-            enable_streaming_llm(model, n_sink=config["sink"], window_size=config["window"], debug=False)
-            
-        elif config["type"] == "streaming_flash_attn":
-            print("Enabling Real Streaming Flash Attention (SDPA)...")
-            # 同样需要 patch 计时器，这部分逻辑在 pythia_streaming_flash.py 中如果没实现，需要补充
-            enable_streaming_flash_attn(model, n_sink=config["sink"], window_size=config["window"])
-            # Manually set debug=True for the cache to verify truncation
-            # We need to iterate over layers to find where the cache is stored or just rely on the next forward pass
-            # Since enable_streaming_flash_attn replaces model.forward, we can pass debug=True there if supported,
-            # but currently it's hardcoded or uses default. Let's patch it or just wait for the run.
-            # Actually, let's force the model to use debug mode in the cache
-            pass
-
-        torch.cuda.empty_cache()
-        gc.collect()
-        
-        # 2. Measure PPL (chunk size 128 for consistency with main.py)
-        print("Measuring PPL...")
-        chunk_size = 128
-        wiki_ppl = evaluate_ppl_unified(model, tokenizer, wiki_text, max_tokens=ppl_tokens, chunk_size=chunk_size)
-        pg19_ppl = evaluate_ppl_unified(model, tokenizer, pg19_text, max_tokens=ppl_tokens, chunk_size=chunk_size)
-        
-        # 3. Measure Speed
-        print("Measuring Speed...")
-        prompt = wiki_text[:pre_tokens*4]
+        print(f"Loading model with {attn_impl}...")
         try:
-            speed_metrics = benchmark_generation_speed(model, tokenizer, prompt, num_tokens=speed_tokens, verbose=True)
+            # Use bfloat16 for stability in eager mode, especially for 2.8B model
+            # FP16 eager mode often overflows, causing PPL=inf
+            tokenizer = AutoTokenizer.from_pretrained(model_id)
+            model = AutoModelForCausalLM.from_pretrained(
+                model_id, 
+                dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16, 
+                device_map=device,
+                attn_implementation=attn_impl
+            )
         except Exception as e:
-            print(f"Error in generation: {e}")
-            speed_metrics = {k: 0.0 for k in ["TTFT (s)", "Total Time (s)", "TPOT (ms)", "Throughput (tok/s)", "Avg Attn (ms)", "Peak Mem (GB)"]}
+            print(f"Failed to load model with {attn_impl}: {e}")
+            continue
+
+        # Check if SDPA is actually used
+        print(f"Model config attn_implementation: {getattr(model.config, '_attn_implementation', 'unknown')}")
+
+        for config in configs:
+            config_name = f"{config['name']}"
+            print(f"\nRunning configuration: {config_name} ({attn_impl})")
             
-        print(f"Result: {speed_metrics['Throughput (tok/s)']:.2f} tok/s, Wiki PPL: {wiki_ppl:.2f}")
-        
-        results.append({
-            "name": config["name"],
-            "wiki_ppl": wiki_ppl,
-            "pg19_ppl": pg19_ppl,
-            "total_time": speed_metrics["Total Time (s)"],
-            "avg_attn": speed_metrics["Avg Attn (ms)"],
-            "ttft": speed_metrics["TTFT (s)"],
-            "tpot": speed_metrics["TPOT (ms)"],
-            "throughput": speed_metrics["Throughput (tok/s)"],
-            "peak_mem": speed_metrics["Peak Mem (GB)"]
-        })
-        
-    # Print Table
+            # Reset/Patch
+            disable_streaming_llm(model)
+            
+            if config["type"] == "baseline":
+                patch_attention_layers(model) # Ensure timing is patched for Baseline
+            elif config["type"] == "streaming":
+                enable_streaming_llm(model, n_sink=config["sink"], window_size=config["window"], debug=False)
+            
+            torch.cuda.empty_cache()
+            gc.collect()
+            
+            # PPL
+            chunk_size = 128
+            wiki_ppl = evaluate_ppl_unified(model, tokenizer, wiki_text, max_tokens=ppl_tokens, chunk_size=chunk_size)
+            pg19_ppl = evaluate_ppl_unified(model, tokenizer, pg19_text, max_tokens=ppl_tokens, chunk_size=chunk_size)
+            
+            
+            # Speed
+            prompt = wiki_text[:Pre_tokens*4]
+            speed_metrics = benchmark_generation_speed(model, tokenizer, prompt, num_tokens=speed_tokens)
+            
+            results.append({
+                "name": config_name,
+                "attn": attn_impl,
+                "wiki_ppl": wiki_ppl,
+                "pg19_ppl": pg19_ppl,
+                "total_time": speed_metrics["Total Time (s)"],
+                "avg_attn": speed_metrics["Avg Attn (ms)"],
+                "ttft": speed_metrics["TTFT (s)"],
+                "tpot": speed_metrics["TPOT (ms)"],
+                "throughput": speed_metrics["Throughput (tok/s)"],
+                "peak_mem": speed_metrics["Peak Mem (GB)"]
+            })
+            
+            print(f"  -> Done. Wiki PPL: {wiki_ppl:.2f}, Throughput: {speed_metrics['Throughput (tok/s)']:.2f} tok/s")
+            
+        # Clean up model to free memory for next iteration
+        del model
+        del tokenizer
+        torch.cuda.empty_cache()
+        gc.collect()
+
     print_results_table(results)
 
 if __name__ == "__main__":
-    run_comprehensive_benchmark()
+    run_benchmark()
