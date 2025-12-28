@@ -6,7 +6,7 @@
 
 为了保持根目录整洁，项目核心代码与实验性代码进行了分离：
 
-### 1. 核心运行文件 (根目录)
+### 1. 核心运行文件 (根目录，个人作业)
 
 | 文件名 | 说明 |
 | :--- | :--- |
@@ -14,13 +14,14 @@
 | **`pythia_streaming_patch.py`** | **核心实现**。包含 `StreamingDynamicCache` 类（实现 Sink+Window 驱逐策略）和 Monkey-Patching 逻辑。 |
 | **`requirements.txt`** | 项目运行所需的 Python 依赖库。 |
 
-### 2. 实验与探索 (子目录)
+### 2. 实验与探索 (子目录，小组作业)
 
 | 目录 | 说明 |
 | :--- | :--- |
-| **`optimization/`** | **FlashAttention 集成**。尝试将 StreamingLLM 与 FlashAttention (SDPA) 结合，探索在流式场景下的极限性能优化。 |
-| **`innovation/`** | **压缩算法探索**。包含基于语义块压缩 (Semantic Block Compression) 的尝试，旨在探索比简单滑动窗口更高效的信息保留策略。 |
-| **`cooperate/`** | **混合策略实验**。尝试结合 StreamingLLM 与 H2O (Heavy Hitter Oracle) 等其他稀疏注意力机制。 |
+| **`flash/`** | **性能优化 (FlashAttention)**。对比了 Eager 与 SDPA (FlashAttention) 模式，验证了 SDPA 对 StreamingLLM 的加速效果及 BF16 对数值稳定性的重要性。 |
+| **`quantization/`** | **量化推理 (Quantization)**。探索了 Int8 和 NF4 量化在流式场景下的表现，实现了单卡 2GB 显存运行 3B 模型的高效推理。 |
+| **`compress/`** | **创新压缩 (Innovations)**。基于 POS (词性) 和 Semantic Block (语义块) 的 KV Cache 压缩策略，旨在比简单滑动窗口保留更多语义信息。 |
+| **`h2o/`** | **混合策略 (H2O + Streaming)**。结合了 H2O (Heavy Hitter Oracle) 的重要性筛选机制，显著提升了长文本 PPL 并突破了模型训练长度限制。 |
 | **`debug_streaming/`** | **底层验证**。包含用于验证 Attention Mask 结构、RoPE 维度冲突等底层逻辑的独立测试脚本 (如 `verify_mask_logic.py`)。 |
 | **`note/`** | **早期验证代码**。包含最初的非侵入式实现版本，仅作为原理参考。 |
 
@@ -233,3 +234,21 @@ StreamingLLM 的核心在于保留序列开头的初始 Tokens (Sink) 作为“�
 
 
 ## 团队完成部分说明
+
+本部分简要总结了在优化、压缩、量化及混合策略方面的探索成果。
+
+### 1. 性能优化 (FlashAttention) - `flash/`
+*   **SDPA 加速**: 验证了 PyTorch 2.0+ `SDPA` (Scaled Dot Product Attention) 对流式生成的巨大提升。测试显示，`StreamingLLM + SDPA` 的吞吐量提升了 **65%** (30.77 tok/s)，Attention 计算耗时降低了 **79%** (70ms)。
+*   **数值稳定性**: 解决了 Eager 模式下 FP16 的数值溢出问题，确认了使用 `BF16` (BFloat16) 对于保证大模型推理稳定性的必要性。
+
+### 2. 量化推理 (Quantization) - `quantization/`
+*   **极致显存优化**: 引入 `NF4` (4-bit Normal Float) 量化，将 2.8B 模型的推理显存占用从 5.5GB 压缩至 **1.85GB**，降幅达 **66%**，使得在消费级显卡上运行大模型成为可能。
+*   **速度与质量平衡**: NF4 量化在大幅降低显存的同时，保持了较高的生成速度 (19 tok/s) 和可接受的 PPL 损失。
+
+### 3. 创新压缩策略 (Innovations) - `compress/`
+*   **语义感知缓存**: 提出了 **Semantic Block** 策略，利用语义相似度（Cosine Similarity）而非单纯的时间顺序来保留 KV Block。实验表明，在相同 KV 大小下，该策略的 PPL (10.61) 优于原始 StreamingLLM (11.49)。
+*   **词性过滤**: 尝试了 **POS Aware** 策略，优先保留实词（名词、动词）而驱逐停用词，探索了基于语言学特征的压缩方向。
+
+### 4. H2O 混合机制 (H2O + Streaming) - `h2o/`
+*   **Heavy Hitter Oracle**: 实现了 H2O 算法，通过累积 Attention Score 动态识别并保留“重关注”Token (Heavy Hitters)。
+*   **长文本突破**: H2O 机制不仅显著降低了 PPL (接近 Baseline)，更成功实现了突破模型训练长度限制的生成 (稳定生成 10000+ tokens)，证明了动态稀疏注意力的强大潜力。
