@@ -51,7 +51,9 @@ def load_long_text(dataset_name="wikitext", split="test", limit_chars=50000):
 
         elif dataset_name == "pg19":
             # 从 HuggingFace 加载 PG-19
-            ds = load_dataset("deepmind/pg19", split=split, streaming=True)
+            ds = load_dataset(
+                "deepmind/pg19", split=split, streaming=True, trust_remote_code=True
+            )
             # 取前几个样本拼接
             texts = []
             for i, example in enumerate(ds):
