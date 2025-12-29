@@ -22,6 +22,7 @@
 | **`quantization/`** | **量化推理 (Quantization)**。探索了 Int8 和 NF4 量化在流式场景下的表现，实现了单卡 2GB 显存运行 3B 模型的高效推理。 |
 | **`compress/`** | **创新压缩 (Innovations)**。基于 POS (词性) 和 Semantic Block (语义块) 的 KV Cache 压缩策略，旨在比简单滑动窗口保留更多语义信息。 |
 | **`h2o/`** | **混合策略 (H2O + Streaming)**。结合了 H2O (Heavy Hitter Oracle) 的重要性筛选机制，显著提升了长文本 PPL 并突破了模型训练长度限制。 |
+| **`integrate/`** | **综合集成 (Integration)**。将 Int4 量化与 Semantic Block 语义压缩结合，实现了在极低显存占用下保持高精度与稳定速度的推理方案。 |
 | **`debug_streaming/`** | **底层验证**。包含用于验证 Attention Mask 结构、RoPE 维度冲突等底层逻辑的独立测试脚本 (如 `verify_mask_logic.py`)。 |
 | **`note/`** | **早期验证代码**。包含最初的非侵入式实现版本，仅作为原理参考。 |
 
@@ -252,3 +253,7 @@ StreamingLLM 的核心在于保留序列开头的初始 Tokens (Sink) 作为“�
 ### 4. H2O 混合机制 (H2O + Streaming) - `h2o/`
 *   **Heavy Hitter Oracle**: 实现了 H2O 算法，通过累积 Attention Score 动态识别并保留“重关注”Token (Heavy Hitters)。
 *   **长文本突破**: H2O 机制不仅显著降低了 PPL (接近 Baseline)，更成功实现了突破模型训练长度限制的生成 (稳定生成 10000+ tokens)，证明了动态稀疏注意力的强大潜力。
+
+### 5. 综合集成 (Integration) - `integrate/`
+*   **多维优化融合**: 将 Int4 量化（显存优化）与 Semantic Block（语义感知压缩）相结合，同时结合了默认的flashattn，实现了“1+1>2”的效果。
+*   **综合性能突破**: 实验证明，该组合方案在显存占用降低 **66%** (1.78GB) 的同时，Wikitext PPL (10.88) 优于原始 StreamingLLM，且在长文本生成中保持了稳定的推理速度，实现了显存、精度与速度的最佳平衡。
