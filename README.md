@@ -13,6 +13,8 @@
 | **`main.py`** | **项目主入口**。负责加载模型、数据集，并调度评估任务（PPL测试、速度测试）及调试模式。 |
 | **`pythia_streaming_patch.py`** | **核心实现**。包含 `StreamingDynamicCache` 类（实现 Sink+Window 驱逐策略）和 Monkey-Patching 逻辑。 |
 | **`requirements.txt`** | 项目运行所需的 Python 依赖库。 |
+| **`note/`** | **早期验证代码**。包含最初的非侵入式实现版本，仅作为原理参考。 |
+| **`debug_streaming/`** | **底层验证**。包含用于验证 Attention Mask 结构、RoPE 维度冲突等底层逻辑的独立测试脚本 (如 `verify_mask_logic.py`)。 |
 
 ### 2. 实验与探索 (子目录，小组作业)
 
@@ -23,8 +25,8 @@
 | **`compress/`** | **创新压缩 (Innovations)**。基于 POS (词性) 和 Semantic Block (语义块) 的 KV Cache 压缩策略，旨在比简单滑动窗口保留更多语义信息。 |
 | **`h2o/`** | **混合策略 (H2O + Streaming)**。结合了 H2O (Heavy Hitter Oracle) 的重要性筛选机制，显著提升了长文本 PPL 并突破了模型训练长度限制。 |
 | **`integrate/`** | **综合集成 (Integration)**。将 Int4 量化与 Semantic Block 语义压缩结合，实现了在极低显存占用下保持高精度与稳定速度的推理方案。 |
-| **`debug_streaming/`** | **底层验证**。包含用于验证 Attention Mask 结构、RoPE 维度冲突等底层逻辑的独立测试脚本 (如 `verify_mask_logic.py`)。 |
-| **`note/`** | **早期验证代码**。包含最初的非侵入式实现版本，仅作为原理参考。 |
+
+
 
 ## 个人完成部分说明
 
