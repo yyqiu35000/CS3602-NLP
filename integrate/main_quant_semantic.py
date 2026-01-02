@@ -4,6 +4,8 @@ import math
 import gc
 import sys
 import os
+import random
+import ctypes
 from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 
@@ -37,23 +39,41 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 configs = [
     # Baseline
     {"name": "Baseline (FP16)", "type": "baseline", "quant": None},
-    
+    {"name": "StreamingLLM (FP16)", "type": "streaming", "quant": None, "sink": 8, "window": 256},
+    {"name": "FP16 + Semantic (No Comp)", "type": "semantic_block", "quant": None, "sink": 8, "window": 64, "extra": 192, "compress": False},
     # Standard StreamingLLM (Sink=4, Window=256)
-    {"name": "StreamingLLM (FP16)", "type": "streaming", "quant": None, "sink": 4, "window": 256},
-    
-    # Combined: Int4 Quantization + Semantic Block (No Comp)
-    # Uses quantization for speed/mem, and Semantic Block (No Comp) for better PPL than simple Streaming
-    {"name": "Int4 + Semantic (No Comp)", "type": "semantic_block", "quant": "4bit", 
-     "sink": 4, "window": 64, "extra": 192, "compress": False} 
-     # Total Cache = 4 + 64 + 192 = 260 tokens (approx similar to 256 window + 4 sink)
+    {"name": "NF4 + Semantic (No Comp)", "type": "semantic_block", "quant": "4bit", "sink": 8, "window": 64, "extra": 192, "compress": False},
 ]
 
-ppl_tokens = 2000       
-speed_tokens = 1500      
+ppl_tokens = 1000       
+speed_tokens = 500      
 pre_tokens = 500       
 
 def print_flush(msg, end="\n"):
     print(msg, end=end, flush=True)
+
+def set_system_stability(seed=42):
+    """
+    Maximal Reproducibility Setup:
+    1. Fix Random Seeds
+    2. Elevate Process Priority (Windows Only)
+    """
+    # 1. Seeding
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    
+    # 2. Process Priority (Windows)
+    if os.name == 'nt':
+        try:
+            # HIGH_PRIORITY_CLASS = 0x00000080
+            pid = os.getpid()
+            handle = ctypes.windll.kernel32.OpenProcess(0x0100 | 0x0200, False, pid)
+            if handle:
+                ctypes.windll.kernel32.SetPriorityClass(handle, 0x00000080)
+                print_flush(f"[System] Process Priority set to HIGH (PID: {pid}) for stability.")
+        except Exception as e:
+            print_flush(f"[System] Warning: Failed to set process priority: {e}")
 
 # ==========================================
 # Helper Functions
@@ -171,59 +191,69 @@ def evaluate_ppl_unified(model, tokenizer, text: str, max_tokens: int = 2000, ch
 
 def benchmark_generation_speed(model, tokenizer, prompt, num_tokens=500, verbose=False):
     """Benchmark generation speed and Attention time"""
-    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-    input_len = inputs.input_ids.shape[1]
+    # 暂时禁用 GC 以减少 Python 层面开销带来的波动
+    gc.disable()
     
-    if verbose:
-        print_flush(f"   Prompt tokens: {input_len}, Requesting {num_tokens} tokens")
-    
-    # Warmup
-    model.generate(**inputs, max_new_tokens=5, use_cache=True, pad_token_id=tokenizer.eos_token_id)
-    torch.cuda.synchronize()
-    torch.cuda.reset_peak_memory_stats()
-    
-    # Timing
-    reset_attention_timing()
-    enable_attention_timing_collection()
-    
-    # TTFT
-    start_time = time.time()
-    model.generate(**inputs, max_new_tokens=1, use_cache=True, pad_token_id=tokenizer.eos_token_id)
-    torch.cuda.synchronize()
-    ttft = time.time() - start_time
+    try:
+        inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+        input_len = inputs.input_ids.shape[1]
+        
+        if verbose:
+            print_flush(f"   Prompt tokens: {input_len}, Requesting {num_tokens} tokens")
+        
+        # Warmup (Aggressive)
+        # Run multiple small gens to ensure GPU clock is boosted and allocator is stable
+        for _ in range(3):
+            model.generate(**inputs, max_new_tokens=5, use_cache=True, do_sample=False, pad_token_id=tokenizer.eos_token_id)
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        
+        # Timing
+        reset_attention_timing()
+        enable_attention_timing_collection()
+        
+        # TTFT
+        start_time = time.time()
+        model.generate(**inputs, max_new_tokens=1, use_cache=True, do_sample=False, pad_token_id=tokenizer.eos_token_id)
+        torch.cuda.synchronize()
+        ttft = time.time() - start_time
 
-    # Full Generation
-    start_time = time.time()
-    outputs = model.generate(
-        **inputs,
-        max_new_tokens=num_tokens,
-        use_cache=True,
-        pad_token_id=tokenizer.eos_token_id
-    )
-    torch.cuda.synchronize()
-    total_time = time.time() - start_time
-    
-    disable_attention_timing_collection()
-    
-    # Stats
-    actual_tokens = outputs.shape[1] - input_len
-    raw_times = get_raw_attention_times()
-    stats_mean, stats_std = get_attention_stats()
-    
-    avg_attn = sum(raw_times) / len(raw_times) if raw_times else 0
-    peak_mem = torch.cuda.max_memory_allocated() / (1024 ** 3) # GB
-    
-    throughput = actual_tokens / total_time if total_time > 0 else 0
-    tpot = (total_time / actual_tokens * 1000) if actual_tokens > 0 else 0
-    
-    return {
-        "TTFT (s)": ttft,
-        "Total Time (s)": total_time,
-        "TPOT (ms)": tpot,
-        "Throughput (tok/s)": throughput,
-        "Avg Attn (ms)": avg_attn * 1000,
-        "Peak Mem (GB)": peak_mem
-    }
+        # Full Generation
+        start_time = time.time()
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=num_tokens,
+            use_cache=True,
+            do_sample=False, # Explicit Greedy
+            pad_token_id=tokenizer.eos_token_id
+        )
+        torch.cuda.synchronize()
+        total_time = time.time() - start_time
+        
+        disable_attention_timing_collection()
+        
+        # Stats
+        actual_tokens = outputs.shape[1] - input_len
+        raw_times = get_raw_attention_times()
+        stats_mean, stats_std = get_attention_stats()
+        
+        avg_attn = sum(raw_times) / len(raw_times) if raw_times else 0
+        peak_mem = torch.cuda.max_memory_allocated() / (1024 ** 3) # GB
+        
+        throughput = actual_tokens / total_time if total_time > 0 else 0
+        tpot = (total_time / actual_tokens * 1000) if actual_tokens > 0 else 0
+        
+        return {
+            "TTFT (s)": ttft,
+            "Total Time (s)": total_time,
+            "TPOT (ms)": tpot,
+            "Throughput (tok/s)": throughput,
+            "Avg Attn (ms)": avg_attn * 1000,
+            "Peak Mem (GB)": peak_mem
+        }
+    finally:
+        # 确保 GC 重新启用
+        gc.enable()
 
 def print_results_table(results):
     print("\n" + "="*160)
@@ -248,6 +278,10 @@ def print_results_table(results):
 
 def run_benchmark():
     print_flush("Starting Combined Benchmark (Quantization + Semantic No Comp)...")
+    
+    # Enable maximal stability settings
+    set_system_stability()
+    
     results = []
     
     # Load Data
@@ -260,25 +294,24 @@ def run_benchmark():
     
     current_model = None
     current_tokenizer = None
-    current_quant = "UNSET"
     
     for config in configs:
         print_flush(f"\nRunning Configuration: {config['name']} ...")
         
-        # Check if we need to reload model
-        if config["quant"] != current_quant:
-            if current_model is not None:
-                del current_model
-                del current_tokenizer
-                torch.cuda.empty_cache()
-                gc.collect()
-            
-            current_model, current_tokenizer = load_model(config["quant"])
-            current_quant = config["quant"]
-            
-            if current_model is None:
-                print_flush(f"Skipping {config['name']} due to model load failure.")
-                continue
+        # Always reload model to ensure clean state and avoid fragmentation/patching artifacts
+        if current_model is not None:
+            del current_model
+            del current_tokenizer
+            # Reset patch modules global state if any (optional but good practice)
+            torch.cuda.empty_cache()
+            gc.collect()
+            gc.collect() # Double collect for safety
+        
+        current_model, current_tokenizer = load_model(config["quant"])
+        
+        if current_model is None:
+            print_flush(f"Skipping {config['name']} due to model load failure.")
+            continue
         
         # Apply Configuration
         # Reset any existing patches

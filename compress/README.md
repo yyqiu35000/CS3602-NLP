@@ -28,14 +28,16 @@
 
 测试环境统一使用 `SDPA` (Flash Attention) 加速，并控制总 KV Cache 大小进行公平对比。
 
-| Configuration | Type | Wiki PPL | Throughput (tok/s) | Avg Attn (ms) | Peak Mem (GB) | KV Size (MB) |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Baseline** | Full Attention | **6.97** | 28.27 | 109.96 | 5.48 | 0.00 |
-| **StreamingLLM (Original)** | Sliding Window | 11.49 | 30.19 | 81.29 | 5.31 | 82.50 |
-| **Streaming+Pos** | POS Filtered | 11.49 | 30.35 | 81.05 | 5.31 | 82.50 |
-| **Streaming+Semantic (Fixed)** | Compressed (16x) | 12.12 | **30.62** | **70.53** | **5.28** | **60.00** |
-| **Streaming+Semantic (Dynamic)** | Compressed (Dyn) | 12.12 | 30.49 | 74.70 | **5.28** | **60.00** |
-| **Streaming+Semantic (No Comp)** | Selection Only | **10.61** | 30.10 | 76.23 | 5.31 | 82.50 |
+参数设置：均保持8+256大小cache（特殊方法均在8+192+64窗口内进行）
+
+| Configuration | Type | Wiki PPL | PG-19 PPL | Total Time (s) | Avg Attn (ms) | TTFT (s) | TPOT (ms) | Throughput | Peak Mem (GB) | KV Size (MB) |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Baseline** | Full Attention | **6.97** | **8.57** | 18.34 | 117.43 | 0.1116 | 36.69 | 27.26 | 5.48 | 0.00 |
+| **StreamingLLM (Original)** | Sliding Window | 11.49 | 8.70 | 17.44 | 96.97 | 0.1215 | 34.89 | 28.66 | 5.31 | 82.50 |
+| **Streaming+Pos** | POS Filtered | 11.49 | 8.71 | **16.88** | **85.53** | 0.1314 | **33.76** | **29.62** | 5.31 | 82.50 |
+| **Streaming+Semantic (Fixed)** | Compressed (16x) | 12.12 | 9.17 | 16.89 | 85.83 | 0.1297 | 33.77 | 29.61 | **5.28** | **60.00** |
+| **Streaming+Semantic (Dynamic)** | Compressed (Dyn) | 12.12 | 9.17 | 17.09 | 89.33 | 0.1339 | 34.18 | 29.26 | **5.28** | **60.00** |
+| **Streaming+Semantic (No Comp)** | Selection Only | **10.61** | 8.77 | 17.15 | 89.38 | 0.1341 | 34.31 | 29.15 | 5.31 | 82.50 |
 
 > **注**: 所有流式配置的总 Token 窗口限制在 ~264 tokens 左右。
 
@@ -48,17 +50,18 @@
 *   **分析**: 相比于 StreamingLLM 仅基于时间滑动窗口保留最近的 Token，Semantic Block 通过计算余弦相似度保留与当前查询最相关的历史块。结果表明，基于语义相关性的选择策略能更有效地保留关键上下文信息，从而提升模型困惑度表现。
 
 ### 3.2 Semantic Block (Fixed/Dynamic Compression) vs. StreamingLLM
-*   **计算效率**: `Streaming+Semantic (Fixed)` 的平均 Attention 计算时间为 **70.53 ms**，相比原始 StreamingLLM (81.29 ms) 降低了约 **13%**。
+*   **计算效率**: `Streaming+Semantic (Fixed)` 的平均 Attention 计算时间为 **85.83 ms**，相比原始 StreamingLLM (96.97 ms) 降低了约 **11%**。
 *   **显存占用**: 通过对非选中块进行 16x 压缩，KV Cache 大小从 82.50 MB 降低至 **60.00 MB**。
 *   **PPL 权衡**: 压缩策略导致 PPL 上升至 **12.12** (相比原始 StreamingLLM 增加 0.63)。这表明虽然压缩能显著提升速度并降低显存，但会对生成质量产生一定负面影响。
 
 ### 3.3 POS Aware vs. StreamingLLM
-*   **性能表现**: `Streaming+Pos` 的 PPL (11.49) 和吞吐量 (30.35 tok/s) 与原始 StreamingLLM 基本一致。
-*   **分析**: 在本测试的窗口限制 (256 tokens) 和数据集下，单纯过滤停用词并未带来额外的 PPL 收益。这可能是因为保留的有效信息与滑动窗口重叠度较高，或者是该策略在当前参数设置下未能显著区分关键信息。
+*   **性能表现**: `Streaming+Pos` 的 PPL (11.49) 与原始 StreamingLLM 一致，但吞吐量提升至 **29.62 tok/s**，是最快的配置之一。
+*   **分析**: 虽然 PPL 没有显著提升，但 POS 筛选可能减少了某些冗余计算或优化了缓存命中模式，从而带来了轻微的速度提升。
 
 ### 3.4 总体对比
-*   **吞吐量**: 所有流式方法 (Innovations) 的吞吐量均稳定在 **30 tok/s** 左右，优于 Baseline 的 28.27 tok/s。
-*   **Attention 耗时**: 流式方法将 Attention 计算时间控制在常数级 (70-80ms)，而 Baseline 随序列长度增加平均耗时为 109.96ms。
+*   **吞吐量**: 所有流式方法 (Innovations) 的吞吐量均在 **29-30 tok/s** 之间，优于 Baseline 的 27.26 tok/s。
+*   **细微speed差异**: 由于后三种方案我们cache的增大速度都会略慢于原始StreamingLLM（原始的经过2264个token就满了，而pos会删一些词，后面方案也有缓冲区域和压缩过程，因此达到token窗口上限的速度会慢于原始StreamingLLM），因此这三种方案的avg attn都略高于原始StreamingLLM。
+*   **Attention 耗时**: 流式方法将 Attention 计算时间控制在 85-97ms 之间，而 Baseline 平均耗时为 117.43ms。
 
 ---
 

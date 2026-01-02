@@ -108,63 +108,70 @@ def evaluate_ppl_unified(model, tokenizer, text: str, max_tokens: int = 2000, ch
 
 def benchmark_generation_speed(model, tokenizer, prompt, num_tokens=500, verbose=False):
     """基准测试生成速度和 Attention 计算时间"""
-    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-    input_len = inputs.input_ids.shape[1]
+    # 暂时禁用 GC 以减少 Python 层面开销带来的波动
+    gc.disable()
     
-    if verbose:
-        print(f"   Prompt tokens: {input_len}, Requesting {num_tokens} tokens")
-    
-    # 预热 (Warmup)
-    model.generate(**inputs, max_new_tokens=5, use_cache=True, pad_token_id=tokenizer.eos_token_id)
-    torch.cuda.synchronize()
-    torch.cuda.reset_peak_memory_stats()
-    
-    # 开启计时
-    reset_attention_timing()
-    enable_attention_timing_collection()
-    
-    # 测量 TTFT (首个 Token 时间)
-    start_time = time.time()
-    model.generate(**inputs, max_new_tokens=1, use_cache=True, pad_token_id=tokenizer.eos_token_id)
-    torch.cuda.synchronize()
-    ttft = time.time() - start_time
+    try:
+        inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+        input_len = inputs.input_ids.shape[1]
+        
+        if verbose:
+            print(f"   Prompt tokens: {input_len}, Requesting {num_tokens} tokens")
+        
+        # 预热 (Warmup)
+        model.generate(**inputs, max_new_tokens=5, use_cache=True, pad_token_id=tokenizer.eos_token_id)
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        
+        # 开启计时
+        reset_attention_timing()
+        enable_attention_timing_collection()
+        
+        # 测量 TTFT (首个 Token 时间)
+        start_time = time.time()
+        model.generate(**inputs, max_new_tokens=1, use_cache=True, pad_token_id=tokenizer.eos_token_id)
+        torch.cuda.synchronize()
+        ttft = time.time() - start_time
 
-    # 测量完整生成
-    start_time = time.time()
-    outputs = model.generate(
-        **inputs,
-        max_new_tokens=num_tokens,
-        use_cache=True,
-        pad_token_id=tokenizer.eos_token_id
-    )
-    torch.cuda.synchronize()
-    total_time = time.time() - start_time
-    
-    disable_attention_timing_collection()
-    
-    # 统计数据
-    actual_tokens = outputs.shape[1] - input_len
-    raw_times = get_raw_attention_times()
-    stats_mean, stats_std = get_attention_stats()
-    
-    avg_attn = sum(raw_times) / len(raw_times) if raw_times else 0
-    peak_mem = torch.cuda.max_memory_allocated() / (1024 ** 3) # GB
-    
-    throughput = actual_tokens / total_time if total_time > 0 else 0
-    tpot = (total_time / actual_tokens * 1000) if actual_tokens > 0 else 0
-    
-    if verbose:
-         print(f"   Avg Attention Time: {stats_mean*1000:.4f} ms +/- {stats_std*1000:.4f}")
-         print(f"   Actual generated: {actual_tokens} tokens, Peak Memory: {peak_mem:.4f} GB")
+        # 测量完整生成
+        start_time = time.time()
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=num_tokens,
+            use_cache=True,
+            pad_token_id=tokenizer.eos_token_id
+        )
+        torch.cuda.synchronize()
+        total_time = time.time() - start_time
+        
+        disable_attention_timing_collection()
+        
+        # 统计数据
+        actual_tokens = outputs.shape[1] - input_len
+        raw_times = get_raw_attention_times()
+        stats_mean, stats_std = get_attention_stats()
+        
+        avg_attn = sum(raw_times) / len(raw_times) if raw_times else 0
+        peak_mem = torch.cuda.max_memory_allocated() / (1024 ** 3) # GB
+        
+        throughput = actual_tokens / total_time if total_time > 0 else 0
+        tpot = (total_time / actual_tokens * 1000) if actual_tokens > 0 else 0
+        
+        if verbose:
+             print(f"   Avg Attention Time: {stats_mean*1000:.4f} ms +/- {stats_std*1000:.4f}")
+             print(f"   Actual generated: {actual_tokens} tokens, Peak Memory: {peak_mem:.4f} GB")
 
-    return {
-        "TTFT (s)": ttft,
-        "Total Time (s)": total_time,
-        "TPOT (ms)": tpot,
-        "Throughput (tok/s)": throughput,
-        "Avg Attn (ms)": avg_attn * 1000,
-        "Peak Mem (GB)": peak_mem
-    }
+        return {
+            "TTFT (s)": ttft,
+            "Total Time (s)": total_time,
+            "TPOT (ms)": tpot,
+            "Throughput (tok/s)": throughput,
+            "Avg Attn (ms)": avg_attn * 1000,
+            "Peak Mem (GB)": peak_mem
+        }
+    finally:
+        # 确保 GC 重新启用
+        gc.enable()
 
 def print_results_table(results):
     """打印 Markdown 格式的结果表格"""

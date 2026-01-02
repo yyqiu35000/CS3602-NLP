@@ -29,9 +29,10 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 
 configs = [
     {"name": "Baseline (FP16)", "type": "baseline", "quant": None},
-    {"name": "Streaming (FP16)", "type": "streaming", "quant": None, "sink": 4, "window": 256},
-    {"name": "Streaming + Int8", "type": "streaming", "quant": "8bit", "sink": 4, "window": 256},
-    {"name": "Streaming + NF4", "type": "streaming", "quant": "4bit", "sink": 4, "window": 256},
+    {"name": "Baseline + NF4", "type": "baseline", "quant": "4bit"},
+    {"name": "Streaming (FP16)", "type": "streaming", "quant": None, "sink": 8, "window": 256},
+    # {"name": "Streaming + Int8", "type": "streaming", "quant": "8bit", "sink": 8, "window": 256},
+    {"name": "Streaming + NF4", "type": "streaming", "quant": "4bit", "sink": 8, "window": 256},
 ]
 
 ppl_tokens = 1000       
@@ -50,10 +51,7 @@ def load_model(quantization_type=None):
     
     bnb_config = None
     try:
-        if quantization_type == "8bit":
-            import bitsandbytes
-            bnb_config = BitsAndBytesConfig(load_in_8bit=True)
-        elif quantization_type == "4bit":
+        if quantization_type == "4bit":
             import bitsandbytes
             bnb_config = BitsAndBytesConfig(
                 load_in_4bit=True,
@@ -152,49 +150,54 @@ def evaluate_ppl(model, tokenizer, text, max_tokens=2048, chunk_size=512):
     return torch.exp(total_loss / total_tokens).item()
 
 def benchmark_speed(model, tokenizer, prompt_text, gen_tokens=100):
-    inputs = tokenizer(prompt_text, return_tensors="pt").to(model.device)
-    input_len = inputs.input_ids.shape[1]
-    
-    print_flush(f"  > Benchmarking Speed: Prompt={input_len}, Gen={gen_tokens}...")
-    
-    # Warmup
-    model.generate(**inputs, max_new_tokens=5, pad_token_id=tokenizer.eos_token_id)
-    torch.cuda.synchronize()
-    
-    # Reset stats
-    reset_attention_timing()
-    enable_attention_timing_collection()
-    torch.cuda.reset_peak_memory_stats()
-    
-    # 1. Measure TTFT
-    start_t = time.time()
-    model.generate(**inputs, max_new_tokens=1, pad_token_id=tokenizer.eos_token_id)
-    torch.cuda.synchronize()
-    ttft = time.time() - start_t
-    
-    # 2. Measure Generation
-    start_t = time.time()
-    outputs = model.generate(**inputs, max_new_tokens=gen_tokens, pad_token_id=tokenizer.eos_token_id)
-    torch.cuda.synchronize()
-    total_time = time.time() - start_t
-    
-    disable_attention_timing_collection()
-    
-    generated_count = outputs.shape[1] - input_len
-    
-    throughput = generated_count / total_time
-    tpot = (total_time - ttft) / (generated_count - 1) * 1000 if generated_count > 1 else 0
-    peak_mem = torch.cuda.max_memory_allocated() / (1024 ** 3)
-    
-    attn_mean, attn_std = get_attention_stats()
-    
-    return {
-        "TTFT (s)": ttft,
-        "Throughput (tok/s)": throughput,
-        "TPOT (ms)": tpot,
-        "Peak Mem (GB)": peak_mem,
-        "Avg Attn (ms)": attn_mean * 1000
-    }
+    # Disable GC to reduce Python overhead volatility
+    gc.disable()
+    try:
+        inputs = tokenizer(prompt_text, return_tensors="pt").to(model.device)
+        input_len = inputs.input_ids.shape[1]
+        
+        print_flush(f"  > Benchmarking Speed: Prompt={input_len}, Gen={gen_tokens}...")
+        
+        # Warmup
+        model.generate(**inputs, max_new_tokens=5, pad_token_id=tokenizer.eos_token_id)
+        torch.cuda.synchronize()
+        
+        # Reset stats
+        reset_attention_timing()
+        enable_attention_timing_collection()
+        torch.cuda.reset_peak_memory_stats()
+        
+        # 1. Measure TTFT
+        start_t = time.time()
+        model.generate(**inputs, max_new_tokens=1, pad_token_id=tokenizer.eos_token_id)
+        torch.cuda.synchronize()
+        ttft = time.time() - start_t
+        
+        # 2. Measure Generation
+        start_t = time.time()
+        outputs = model.generate(**inputs, max_new_tokens=gen_tokens, pad_token_id=tokenizer.eos_token_id)
+        torch.cuda.synchronize()
+        total_time = time.time() - start_t
+        
+        disable_attention_timing_collection()
+        
+        generated_count = outputs.shape[1] - input_len
+        
+        throughput = generated_count / total_time
+        tpot = (total_time - ttft) / (generated_count - 1) * 1000 if generated_count > 1 else 0
+        peak_mem = torch.cuda.max_memory_allocated() / (1024 ** 3)
+        
+        attn_mean, attn_std = get_attention_stats()
+        
+        return {
+            "TTFT (s)": ttft,
+            "Throughput (tok/s)": throughput,
+            "TPOT (ms)": tpot,
+            "Peak Mem (GB)": peak_mem,
+            "Avg Attn (ms)": attn_mean * 1000
+        }
+    finally:
+        gc.enable()
 
 # ==========================================
 # Main Execution
@@ -240,12 +243,8 @@ def run_benchmark():
         # Run PPL Eval
         print_flush("Evaluating WikiText PPL:")
         wiki_ppl = evaluate_ppl(model, tokenizer, wiki_text, max_tokens=ppl_tokens, chunk_size=512)
-        print_flush(f"  > WikiText PPL: {wiki_ppl:.2f}")
-
         print_flush("Evaluating PG-19 PPL:")
         pg19_ppl = evaluate_ppl(model, tokenizer, pg19_text, max_tokens=ppl_tokens, chunk_size=512)
-        print_flush(f"  > PG-19 PPL: {pg19_ppl:.2f}")
-        
         # Run Speed Eval
         speed_metrics = benchmark_speed(model, tokenizer, prompt_text, gen_tokens=speed_tokens)
         print_flush(f"  > Speed: {speed_metrics['Throughput (tok/s)']:.2f} tok/s, Mem: {speed_metrics['Peak Mem (GB)']:.2f} GB")
@@ -273,3 +272,4 @@ def run_benchmark():
 
 if __name__ == "__main__":
     run_benchmark()
+
