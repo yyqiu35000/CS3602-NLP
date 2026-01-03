@@ -33,7 +33,6 @@
 
 ## 3. 实验结果 (Pythia-2.8B)
 
-### 3.1 场景一：短文本生成
 **设置**：`ppl_tokens=1000`, `prompt_len=500`, `gen_len=500`
 
 | Configuration | Wikitext PPL | PG-19 PPL | Total Time (s) | Avg Attn (ms) | Throughput (tok/s) | Peak Mem (GB) |
@@ -43,7 +42,6 @@
 | **FP16 + Semantic** | 10.43 | 8.73 | 16.51 | 78.85 | 30.28 | 5.31 |
 | **NF4 + Semantic** | **10.93** | 9.15 | 18.54 | **81.83** | 26.97 | **1.85** |
 
-### 3.2 场景二：长文本生成
 
 
 ## 4. 结果分析
