@@ -275,11 +275,11 @@ def print_results_table(results):
     for row in results:
         print(
             f"| {row['name']:<20} | "
-            f"{row['wiki_ppl']:<14.4f} | "
-            f"{row['pg19_ppl']:<12.4f} | "
-            f"{row['total_time']:<14.4f} | "
-            f"{row['avg_attn']:<14.4f} | "
-            f"{row['ttft']:<10.4f} | "
+            f"{row['wiki_ppl']:<14.2f} | "
+            f"{row['pg19_ppl']:<12.2f} | "
+            f"{row['total_time']:<14.2f} | "
+            f"{row['avg_attn']:<14.2f} | "
+            f"{row['ttft']:<10.2f} | "
             f"{row['tpot']:<10.2f} | "
             f"{row['throughput']:<18.2f} | "
             f"{row['peak_mem']:<13.2f} |"
